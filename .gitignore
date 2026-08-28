@@ -1,0 +1,8 @@
+.env
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+junohub-web/node_modules/
+junohub-web/.next/
+junohub-server/target/
