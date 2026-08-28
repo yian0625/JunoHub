@@ -1,0 +1,7 @@
+target
+junohub.db*
+.env
+.git
+.DS_Store
+README.md
+MIGRATION.md

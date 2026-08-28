@@ -1,0 +1,57 @@
+name: junohub
+
+services:
+  junohub-server:
+    build:
+      context: ./junohub-server
+      dockerfile: Dockerfile
+    environment:
+      JUNOHUB_BIND: 0.0.0.0:9003
+      JUNOHUB_DATABASE_URL: sqlite:///data/junohub.db?mode=rwc
+      JUNOHUB_JWT_SECRET: ${JUNOHUB_JWT_SECRET:?请在 .env 中设置 JUNOHUB_JWT_SECRET}
+      JUNOHUB_ENCRYPTION_KEY: ${JUNOHUB_ENCRYPTION_KEY:?请在 .env 中设置 JUNOHUB_ENCRYPTION_KEY}
+      JUNOHUB_BOOTSTRAP_ADMIN_EMAIL: ${JUNOHUB_BOOTSTRAP_ADMIN_EMAIL:-}
+      JUNOHUB_BOOTSTRAP_ADMIN_PASSWORD: ${JUNOHUB_BOOTSTRAP_ADMIN_PASSWORD:-}
+      RUST_LOG: ${RUST_LOG:-junohub_server=info,tower_http=info}
+    volumes:
+      - junohub-data:/data
+    ports:
+      - "${JUNOHUB_API_PORT:-9003}:9003"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9003/health/readiness"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+
+  junohub-web:
+    build:
+      context: ./junohub-web
+      dockerfile: Dockerfile
+      args:
+        JUNO_HUB_API_URL: http://junohub-server:9003
+    environment:
+      JUNO_HUB_API_URL: http://junohub-server:9003
+      HOSTNAME: 0.0.0.0
+      PORT: 3003
+    depends_on:
+      junohub-server:
+        condition: service_healthy
+    ports:
+      - "${JUNOHUB_WEB_PORT:-3003}:3003"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3003/login').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+
+volumes:
+  junohub-data:
+    name: junohub-data
