@@ -53,10 +53,13 @@ init_env() {
     return
   fi
   require_command openssl
-  local jwt_secret encryption_key admin_password
+  local jwt_secret encryption_key admin_password postgres_password redis_password
   jwt_secret="$(random_hex 32)"
   encryption_key="$(random_hex 32)"
   admin_password="$(random_hex 16)"
+  postgres_password="$(random_hex 32)"
+  redis_password="$(random_hex 32)"
+  mkdir -p "$ROOT_DIR/data/accounts/postgres" "$ROOT_DIR/data/accounts/redis"
   umask 077
   cat >"$ENV_FILE" <<EOF
 JUNOHUB_JWT_SECRET=$jwt_secret
@@ -66,17 +69,25 @@ JUNOHUB_BOOTSTRAP_ADMIN_PASSWORD=$admin_password
 JUNOHUB_WEB_PORT=3003
 JUNOHUB_API_PORT=9003
 RUST_LOG=junohub_server=info,tower_http=info
+
+# Rust 账户引擎数据面（PostgreSQL + Redis）
+POSTGRES_USER=sub2api
+POSTGRES_PASSWORD=$postgres_password
+POSTGRES_DB=sub2api
+REDIS_PASSWORD=$redis_password
+REDIS_DB=0
+ADMIN_EMAIL=admin@sub2api.local
 EOF
   chmod 600 "$ENV_FILE"
   echo "已生成安全配置：$ENV_FILE"
-  echo "引导账户：admin@junohub.local（role=admin）"
-  echo "账户密码：$admin_password"
-  echo "该账户与普通用户使用同一登录入口；请立即保存密码，并长期备份 JUNOHUB_ENCRYPTION_KEY。"
+  echo "JunoHub 引导账户：admin@junohub.local（role=admin）"
+  echo "JunoHub 账户密码：$admin_password"
+  echo "请长期备份 .env 文件以及 data/accounts 数据目录。"
 }
 
 ensure_env() {
   if [[ ! -f "$ENV_FILE" ]]; then
-    echo "未发现 .env，正在生成安全配置。"
+    echo "发现缺失的运行配置，正在生成。"
     init_env
   fi
 }
@@ -114,6 +125,7 @@ case "$command_name" in
   update)
     check_docker
     ensure_env
+    compose pull junohub-accounts-postgres junohub-accounts-redis
     compose build --pull
     compose up -d --remove-orphans --wait
     compose ps

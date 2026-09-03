@@ -69,6 +69,7 @@ export interface AuthResponse {
   uid: number | string
   nickname: string
   email?: string
+  avatar_url?: string
   role: "admin" | "user"
 }
 
@@ -92,6 +93,18 @@ export interface ConsoleModel {
   enabled: number
 }
 
+export interface ConsoleLog {
+  id: number
+  api_key_id: number
+  model_alias: string
+  upstream_model: string
+  provider_type: string
+  status_code: number
+  duration_ms: number
+  error_message: string
+  create_time: number
+}
+
 export interface ConsoleKey {
   id: number
   name: string
@@ -109,23 +122,43 @@ export const authAPI = {
   register: (data: { email: string; password: string; display_name?: string }) => request<AuthResponse>("/auth/register", data),
 }
 
+export interface AccountProfile {
+  uid: number | string
+  nickname: string
+  display_name: string
+  email: string
+  avatar_url: string
+  role: "admin" | "user"
+}
+
+export const accountAPI = {
+  profile: () => request<AccountProfile>("/account-api/profile"),
+  updateProfile: (data: { display_name?: string; avatar_url?: string }) => request<AccountProfile>("/account-api/profile/update", data),
+  updatePassword: (data: { current_password: string; new_password: string }) => request<Record<string, never>>("/account-api/password/update", data),
+}
+
 export const consoleAPI = {
   profile: () => request<Record<string, unknown>>("/console-api/profile"),
-  stats: () => request<{ providers: number; models: number; keys: number; requests: number }>("/console-api/stats"),
+  stats: (since?: number) => request<{ providers: number; models: number; keys: number; requests: number }>("/console-api/stats", { since }),
+  createSub2apiApiKeyAccount: (data: { platform: string; name: string; api_key: string; base_url: string }) => request<{ provider_id: number; imported_count: number; skipped_count: number }>("/console-api/sub2api/accounts/api-key", data),
+  startOpenAIOAuth: () => request<{ auth_url: string; session_id: string; state: string }>("/console-api/sub2api/oauth/openai/start"),
+  completeOpenAIOAuth: (data: { session_id: string; state: string; code: string; name?: string }) => request<{ provider_id: number; imported_count: number; skipped_count: number }>("/console-api/sub2api/oauth/openai/complete", data),
   providerList: () => request<{ list: ConsoleProvider[]; total: number }>("/console-api/provider/list"),
   providerCreate: (data: { name: string; provider_type: string; base_url: string; api_key: string }) => request<ConsoleProvider>("/console-api/provider/create", data),
   providerUpdate: (data: { id: number; name?: string; provider_type?: string; base_url?: string; api_key?: string; enabled?: number }) => request<ConsoleProvider>("/console-api/provider/update", data),
   providerDelete: (id: number) => request<Record<string, never>>("/console-api/provider/delete", { id }),
   providerTest: (id: number) => request<{ ok: boolean; status_code: number }>("/console-api/provider/test", { id }),
+  providerModels: (id: number) => request<{ models: string[]; total: number }>("/console-api/provider/models", { id }),
   modelList: () => request<{ list: ConsoleModel[]; total: number }>("/console-api/model/list"),
   modelCreate: (data: { provider_id: number; alias: string; upstream_model: string; capabilities?: string[] }) => request<ConsoleModel>("/console-api/model/create", data),
+  modelImport: (data: { provider_id: number; models: string[] }) => request<{ imported: string[]; skipped: string[]; imported_count: number; skipped_count: number }>("/console-api/model/import", data),
   modelUpdate: (data: { id: number; provider_id?: number; alias?: string; upstream_model?: string; capabilities?: string[]; enabled?: number }) => request<ConsoleModel>("/console-api/model/update", data),
   modelDelete: (id: number) => request<Record<string, never>>("/console-api/model/delete", { id }),
   keyList: () => request<{ list: ConsoleKey[]; total: number }>("/console-api/key/list"),
   keyCreate: (data: { name: string; allowed_models?: string[]; expires_at?: number }) => request<ConsoleKey>("/console-api/key/create", data),
   keyUpdate: (data: { id: number; name?: string; allowed_models?: string[]; status?: number; expires_at?: number }) => request<ConsoleKey>("/console-api/key/update", data),
   keyDelete: (id: number) => request<Record<string, never>>("/console-api/key/delete", { id }),
-  logs: (page = 1, pageSize = 20) => request<{ list: Array<Record<string, unknown>>; total: number }>("/console-api/logs", { page, page_size: pageSize }),
+  logs: (page = 1, pageSize = 20) => request<{ list: ConsoleLog[]; total: number; page: number; page_size: number }>("/console-api/logs", { page, page_size: pageSize }),
 }
 
 export const adminUserAPI = {

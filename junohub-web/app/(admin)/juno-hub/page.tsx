@@ -68,16 +68,16 @@ export default function AdminPage() {
   const actionDescription = action?.type === "status" && action.user.status === 1 ? "停用后，该用户将无法登录，现有访问密钥也会立即失效。" : action?.type === "role" && action.user.role === "admin" ? "该用户将无法继续管理其他账户，但仍可使用个人模型网关。" : "此更改会立即生效，你可以稍后再次调整。"
 
   return (
-    <div className="view-enter space-y-10">
-      <header className="border-b border-border-subtle pb-10"><p className="eyebrow mb-3">系统管理</p><h1 className="page-heading">用户管理</h1><p className="page-lead mt-3">查看工作区成员，管理账户状态和系统权限。</p></header>
+    <div className="view-enter space-y-8">
+      <header><h1 className="page-heading">用户管理</h1><p className="page-lead mt-2.5">查看工作区成员，管理账户状态和系统权限。</p></header>
 
-      <section className="grid grid-cols-3 overflow-hidden rounded-xl border border-border-subtle bg-bg-surface" aria-label="用户概览">
+      <section className="grid grid-cols-3 gap-4" aria-label="用户概览">
         <SummaryMetric label="用户总数" value={users.length} icon={Users} />
         <SummaryMetric label="正常账户" value={activeCount} icon={UserCheck} />
         <SummaryMetric label="管理员" value={adminCount} icon={Shield} />
       </section>
 
-      <Card className="shadow-none">
+      <Card>
         <CardHeader className="gap-4 sm:grid-cols-[1fr_minmax(240px,340px)] sm:items-end">
           <div><CardTitle>注册用户</CardTitle><CardDescription className="mt-1.5">账户状态会同时影响登录和访问密钥。</CardDescription></div>
           <label className="relative block"><span className="sr-only">搜索用户</span><Search className="pointer-events-none absolute inset-inline-start-3.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" /><Input name="user-search" type="search" value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索姓名、邮箱或 ID" className="ps-10" /></label>
@@ -96,15 +96,15 @@ export default function AdminPage() {
 }
 
 function SummaryMetric({ label, value, icon: Icon }: { label: string; value: number; icon: React.ElementType }) {
-  return <div className="border-e border-border-subtle p-4 last:border-e-0 sm:p-5"><div className="flex items-center justify-between gap-2"><p className="text-[11px] font-medium text-muted-foreground sm:text-xs">{label}</p><Icon className="hidden size-4 text-text-disabled sm:block" strokeWidth={1.5} aria-hidden="true" /></div><p className="mt-5 font-mono text-3xl font-medium tracking-[-.06em] tabular-nums">{value}</p></div>
+  return <div className="surface-card rounded-2xl p-5"><div className="flex items-center justify-between gap-2"><p className="text-xs font-medium text-muted-foreground">{label}</p><span className="grid size-8 place-items-center rounded-lg bg-accent-subtle text-accent-text"><Icon className="size-4" strokeWidth={1.75} aria-hidden="true" /></span></div><p className="mt-4 font-mono text-3xl font-medium tracking-[-.06em] tabular-nums">{value}</p></div>
 }
 
 function UserItem({ item, busy, onAction }: { item: UserRow; busy: boolean; onAction: (type: "status" | "role") => void }) {
   const name = item.display_name || item.email
   return (
-    <article className="flex flex-col gap-4 px-5 py-5 sm:px-6 lg:flex-row lg:items-center lg:justify-between">
-      <div className="flex min-w-0 items-start gap-3.5"><span className="grid size-9 shrink-0 place-items-center rounded-md bg-accent-solid text-sm font-semibold text-text-inverse" aria-hidden="true">{name.slice(0, 1).toUpperCase()}</span><div className="min-w-0"><p className="break-words text-sm font-semibold">{name}</p><p className="mt-1 break-all font-mono text-xs text-muted-foreground"><bdi>{item.email}</bdi></p><p className="mt-1 text-[11px] text-muted-foreground">用户 ID {item.id} · 注册于 {new Date(item.create_time * 1000).toLocaleDateString("zh-CN")}</p></div></div>
-      <div className="flex flex-wrap items-center gap-2 ps-[54px] lg:justify-end lg:ps-0"><span className={item.status === 1 ? "inline-flex items-center gap-1.5 rounded-full bg-success-subtle px-2.5 py-1 text-xs font-medium text-success-text" : "inline-flex items-center gap-1.5 rounded-full bg-bg-sunken px-2.5 py-1 text-xs font-medium text-muted-foreground"}>{item.status === 1 ? <UserCheck className="size-3.5" aria-hidden="true" /> : <UserX className="size-3.5" aria-hidden="true" />}{item.status === 1 ? "正常" : "已停用"}</span><span className="inline-flex items-center gap-1.5 rounded-full bg-bg-sunken px-2.5 py-1 text-xs font-medium text-muted-foreground"><Shield className="size-3.5" aria-hidden="true" />{item.role === "admin" ? "管理员" : "普通用户"}</span><Button size="sm" variant="outline" onClick={() => onAction("role")} disabled={busy}>{item.role === "admin" ? "移除权限" : "授予权限"}</Button><Button size="sm" variant="outline" onClick={() => onAction("status")} disabled={busy} className={item.status === 1 ? "hover:bg-danger-subtle hover:text-danger-text" : "hover:bg-success-subtle hover:text-success-text"}>{busy && <RotateCw className="animate-spin" aria-hidden="true" />}{item.status === 1 ? "停用账户" : "启用账户"}</Button></div>
+    <article className="flex flex-col gap-4 px-5 py-5 transition-colors duration-150 hover:bg-bg-sunken/60 sm:px-6 lg:flex-row lg:items-center lg:justify-between">
+      <div className="flex min-w-0 items-start gap-3.5"><span className="grid size-9 shrink-0 place-items-center rounded-full bg-accent-solid text-sm font-semibold text-text-inverse" aria-hidden="true">{name.slice(0, 1).toUpperCase()}</span><div className="min-w-0"><p className="break-words text-sm font-semibold">{name}</p><p className="mt-1 break-all font-mono text-xs text-muted-foreground"><bdi>{item.email}</bdi></p><p className="mt-1 text-[11px] text-muted-foreground">用户 ID {item.id} · 注册于 {new Date(item.create_time * 1000).toLocaleDateString("zh-CN")}</p></div></div>
+      <div className="flex flex-wrap items-center gap-2 ps-[54px] lg:justify-end lg:ps-0"><span className={item.status === 1 ? "inline-flex items-center gap-1.5 rounded-full bg-success-subtle px-2.5 py-1 text-xs font-medium text-success-text ring-1 ring-inset ring-success-solid/25" : "inline-flex items-center gap-1.5 rounded-full bg-bg-sunken px-2.5 py-1 text-xs font-medium text-muted-foreground ring-1 ring-inset ring-border-default"}>{item.status === 1 ? <UserCheck className="size-3.5" aria-hidden="true" /> : <UserX className="size-3.5" aria-hidden="true" />}{item.status === 1 ? "正常" : "已停用"}</span><span className={item.role === "admin" ? "inline-flex items-center gap-1.5 rounded-full bg-accent-subtle px-2.5 py-1 text-xs font-medium text-accent-text ring-1 ring-inset ring-accent-solid/20" : "inline-flex items-center gap-1.5 rounded-full bg-bg-sunken px-2.5 py-1 text-xs font-medium text-muted-foreground ring-1 ring-inset ring-border-default"}><Shield className="size-3.5" aria-hidden="true" />{item.role === "admin" ? "管理员" : "普通用户"}</span><Button size="sm" variant="outline" onClick={() => onAction("role")} disabled={busy}>{item.role === "admin" ? "移除权限" : "授予权限"}</Button><Button size="sm" variant={item.status === 1 ? "destructive" : "outline"} onClick={() => onAction("status")} disabled={busy}>{busy && <RotateCw className="animate-spin" aria-hidden="true" />}{item.status === 1 ? "停用账户" : "启用账户"}</Button></div>
     </article>
   )
 }

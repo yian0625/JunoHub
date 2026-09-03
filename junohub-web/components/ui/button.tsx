@@ -6,13 +6,13 @@ import { cva, type VariantProps } from "class-variance-authority"
 import { cn } from "@/lib/utils"
 
 const buttonVariants = cva(
-  "group/button inline-flex shrink-0 touch-manipulation items-center justify-center rounded-lg border border-transparent bg-clip-padding text-sm font-semibold whitespace-nowrap transition-[scale,background-color,color,box-shadow,border-color] duration-150 ease-out outline-none select-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:not-aria-[haspopup]:scale-[0.96] disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg]:stroke-[2] [&_svg:not([class*='size-'])]:size-4",
+  "group/button inline-flex shrink-0 touch-manipulation items-center justify-center rounded-full border border-transparent bg-clip-padding text-sm font-semibold whitespace-nowrap transition-[scale,background-color,color,box-shadow,border-color] duration-150 ease-out outline-none select-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:not-aria-[haspopup]:scale-[0.96] disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg]:stroke-[2] [&_svg:not([class*='size-'])]:size-4",
   {
     variants: {
       variant: {
         default: "bg-accent-solid text-primary-foreground [a]:hover:bg-[var(--semantic-accent-solid-hover)] hover:bg-[var(--semantic-accent-solid-hover)]",
         outline:
-          "border-transparent bg-bg-surface text-foreground shadow-[var(--shadow-surface)] hover:bg-bg-sunken hover:shadow-[var(--shadow-surface-hover)] aria-expanded:bg-muted aria-expanded:text-foreground",
+          "border-border-default bg-bg-surface text-foreground shadow-[var(--shadow-surface)] hover:border-border-strong hover:bg-bg-sunken hover:shadow-[var(--shadow-surface-hover)] aria-expanded:bg-muted aria-expanded:text-foreground",
         secondary:
           "bg-secondary text-secondary-foreground hover:bg-secondary/80 aria-expanded:bg-secondary aria-expanded:text-secondary-foreground",
         ghost:

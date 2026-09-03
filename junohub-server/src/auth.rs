@@ -67,6 +67,28 @@ fn decode_user(state: &AppState, token: &str) -> AppResult<CurrentUser> {
     })
 }
 
+pub async fn require_account(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> AppResult<Response> {
+    let token = bearer(&request).ok_or(AppError::Unauthorized)?;
+    let mut user = decode_user(&state, token)?;
+    let row: Option<(String, i64)> = sqlx::query_as("SELECT role,status FROM users WHERE id=?")
+        .bind(user.uid)
+        .fetch_optional(&state.pool)
+        .await?;
+    let Some((role, status)) = row else {
+        return Err(AppError::Unauthorized);
+    };
+    if status != 1 || !matches!(role.as_str(), "admin" | "user") {
+        return Err(AppError::Unauthorized);
+    }
+    user.role = role;
+    request.extensions_mut().insert(user);
+    Ok(next.run(request).await)
+}
+
 pub async fn require_admin(
     State(state): State<AppState>,
     mut request: Request,
@@ -103,7 +125,7 @@ pub async fn require_user(
     let Some((role, status)) = row else {
         return Err(AppError::Unauthorized);
     };
-    if role != "user" || status != 1 {
+    if !matches!(role.as_str(), "user" | "admin") || status != 1 {
         return Err(AppError::Unauthorized);
     }
     user.role = role;
