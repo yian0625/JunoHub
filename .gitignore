@@ -6,3 +6,6 @@
 junohub-web/node_modules/
 junohub-web/.next/
 junohub-server/target/
+
+# Rust 账户引擎持久化数据
+data/

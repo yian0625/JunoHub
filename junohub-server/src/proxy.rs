@@ -60,6 +60,35 @@ pub async fn passthrough(State(state): State<AppState>, request: Request) -> App
     let model = console::resolve_model(&state, key.user_id, &alias).await?;
     let provider = console::load_provider(&state, key.user_id, model.provider_id).await?;
     payload["model"] = json!(model.upstream_model);
+    if provider.provider_type == "sub2api" {
+        if !state.config.account_engine_gateway_enabled
+            || !crate::sub2_gateway::supports_path(&path)
+        {
+            return Err(AppError::BadRequest(
+                "该端点未纳入 Rust 账户引擎，请使用 /v1/chat/completions 或 /v1/responses".into(),
+            ));
+        }
+        let response = crate::sub2_gateway::forward(
+            &state,
+            &provider.api_key,
+            method,
+            &path,
+            &headers,
+            &payload,
+        )
+        .await?;
+        console::record_request(
+            &state,
+            &key,
+            &model,
+            "rust-account-engine",
+            response.status().as_u16(),
+            started.elapsed().as_millis() as i64,
+            "",
+        )
+        .await;
+        return Ok(response);
+    }
     let upstream_path = path.strip_prefix("/v1").unwrap_or(&path);
     let url = format!(
         "{}{}",

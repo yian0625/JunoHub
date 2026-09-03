@@ -1,22 +1,26 @@
 # JunoHub
 
-JunoHub 是独立于 Juno 核心业务服务的多用户 BYOK AI 网关。平台不提供公共模型；用户配置自己的 OpenAI-compatible 上游、模型别名和虚拟 Key：
+JunoHub 是一个集成多账户调度能力的多用户 BYOK AI 网关：
 
-- `junohub-web/`：统一登录入口、用户控制台与权限管理界面，默认端口 `3003`
-- `junohub-server/`：Rust 网关和管理 API，默认端口 `9003`
+- `junohub-web/`：统一登录入口、用户控制台和管理界面，默认端口 `3003`
+- `junohub-server/`：Rust 权限层、模型路由、账户引擎和兼容网关，默认端口 `9003`
+- Rust 账户引擎：账户池、调度、粘性会话、故障切换和上游协议能力（原 Sub2API `v0.1.182` 的 Rust 实现，Go 容器已移除）
+- PostgreSQL / Redis：账户引擎的数据库和缓存，仅在 Compose 内部网络开放，数据保存在 `data/accounts/`
 
 ## Docker 部署
 
-需要 Docker Engine 及 Docker Compose。首次部署先创建生产配置：
-
-推荐直接使用一键脚本，它会自动生成随机密钥和一个带 `admin` 权限标识的引导账户：
+需要 Docker Engine、Docker Compose v2 和 OpenSSL。推荐使用一键脚本：
 
 ```bash
 chmod +x deploy.sh
 ./deploy.sh up
 ```
 
-首次运行会在终端显示引导账户密码，请立即保存。该账户与普通用户使用同一个登录页面。常用脚本命令：
+首次运行会生成一份权限为 `600` 的配置：
+
+- `.env`：JunoHub JWT、加密主密钥、引导管理员，以及账户引擎 PostgreSQL / Redis 凭证
+
+脚本会在终端显示初始管理员密码。请立即保存，并长期备份 `.env` 文件。常用命令：
 
 ```bash
 ./deploy.sh status
@@ -26,45 +30,63 @@ chmod +x deploy.sh
 ./deploy.sh down
 ```
 
-也可以手动使用 Docker Compose。首次部署先创建生产配置：
+部署完成后：
+
+- JunoHub Web：`http://服务器地址:3003`
+- JunoHub OpenAI-compatible API：`http://服务器地址:3003/v1`
+- JunoHub Server：`http://服务器地址:9003`
+
+新增账户引擎供应商时，Base URL 指向 Rust 网关自身（Compose 内部地址）：
+
+```text
+http://junohub-server:9003/v1
+```
+
+首次启动时 `junohub-accounts-postgres` 会使用 `deploy/accounts-schema.sql` 初始化账户引擎表结构（已存在的数据目录不会重复初始化）。
+
+## 数据与备份
+
+JunoHub 业务数据保存在 Docker 命名卷 `junohub-data`。账户引擎数据保存在：
+
+```text
+data/accounts/postgres/
+data/accounts/redis/
+```
+
+备份或迁移前应先停止服务：
+
+```bash
+./deploy.sh down
+tar -czf junohub-backup.tar.gz .env data/accounts
+```
+
+`docker compose down` 不会删除这些数据。不要在服务运行时直接复制 PostgreSQL 数据目录，也不要使用 `docker compose down -v` 删除 JunoHub 数据卷。
+
+## 手动配置
+
+也可以手动创建配置：
 
 ```bash
 cp .env.docker.example .env
+chmod 600 .env
 ```
 
-编辑 `.env`，至少替换以下值并妥善备份：
-
-- `JUNOHUB_JWT_SECRET`：JWT 签名密钥。
-- `JUNOHUB_ENCRYPTION_KEY`：上游 API Key 加密主密钥，部署后不能随意更换。
-- `JUNOHUB_BOOTSTRAP_ADMIN_EMAIL`：初始权限账户邮箱。
-- `JUNOHUB_BOOTSTRAP_ADMIN_PASSWORD`：初始权限账户密码。
-
-建议每个密钥使用不少于 32 字节的随机值，例如通过 `openssl rand -hex 32` 生成。然后在本目录运行：
+必须替换示例中的所有密码和密钥。建议使用：
 
 ```bash
-docker compose up -d --build
-docker compose ps
+openssl rand -hex 32
 ```
 
-部署完成后：
-
-- Web 控制台：`http://服务器地址:3003`
-- OpenAI-compatible API：`http://服务器地址:3003/v1`，也可以直接使用 `http://服务器地址:9003/v1`
-- SQLite 数据：保存在 Docker 命名卷 `junohub-data` 中
-
-常用维护命令：
+配置完成后运行：
 
 ```bash
-docker compose logs -f
-docker compose pull
-docker compose up -d --build
-docker compose down
+docker compose --env-file .env up -d --build --wait
 ```
-
-`docker compose down` 不会删除数据库卷。只有显式执行 `docker compose down -v` 才会删除数据，请谨慎使用。
 
 ## 本地开发
 
-本地开发先启动 `junohub-server`，再启动 `junohub-web`。前端通过 `JUNO_HUB_API_URL` 指向服务端；未设置时默认使用 `http://127.0.0.1:9003`。
+前端开发时先启动 `junohub-server`。前端通过 `JUNO_HUB_API_URL` 指向服务端；未设置时默认使用 `http://127.0.0.1:9003`。
 
-迁移状态、兼容边界和切换流程见 `junohub-server/MIGRATION.md`。
+本地开发账户引擎需要可访问的 PostgreSQL 与 Redis，通过环境变量 `SUB2API_DATABASE_URL` 和 `SUB2API_REDIS_URL` 覆盖（默认主机名 `junohub-accounts-postgres` / `junohub-accounts-redis`）。
+
+迁移状态和兼容边界见 `junohub-server/MIGRATION.md` 与 `junohub-server/SUB2API_RUST_PORT.md`。

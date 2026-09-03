@@ -28,6 +28,8 @@ JunoHub 已成为独立 Rust 服务，并采用纯用户 BYOK 模式：
 
 ## 兼容范围
 
-当前网关支持 OpenAI-compatible JSON 请求、`/v1/models`、普通响应和 SSE/流式响应。它不是 LiteLLM 全量复刻；原生 Anthropic/Gemini 请求转换、multipart 音频、Responses 本地资源、MCP/A2A、SSO/SCIM 等长尾能力需要按实际需求继续实现。
+当前网关支持 OpenAI-compatible JSON 请求、`/v1/models`、普通响应和 SSE/流式响应。它不是 LiteLLM 全量复刻；multipart 音频、Responses 本地资源、MCP/A2A、SSO/SCIM 等长尾能力需要按实际需求继续实现。
+
+Rust 账户引擎（原 Sub2API `v0.1.182`）已完成切换并移除 Go 容器：OpenAI Codex OAuth / Responses、Chat Completions 桥接、Anthropic Messages 与 Gemini generateContent 转换、调度器、粘性会话全部由 `junohub-server` 提供，数据面位于 `data/accounts/`。详见 `SUB2API_RUST_PORT.md`。
 
 早期 Rust 试验版的平台部署代码和管理入口已删除。旧迁移创建的遗留表仅为安全升级保留，运行时不再使用。

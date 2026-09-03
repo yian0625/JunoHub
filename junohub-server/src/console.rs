@@ -1,8 +1,11 @@
+use std::collections::HashSet;
+
 use axum::{
     extract::{Extension, Path, State},
     http::HeaderMap,
     Json,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -15,6 +18,7 @@ use crate::{
     secrets,
     state::AppState,
     store,
+    sub2_repository::Sub2Repository,
 };
 
 #[derive(Deserialize)]
@@ -43,7 +47,7 @@ pub async fn ensure_bootstrap_admin(state: &AppState) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO users(email,password_hash,display_name,role,status,created_at,updated_at) \
          VALUES(?,?,'JunoHub','admin',1,?,?) \
-         ON CONFLICT(email) DO UPDATE SET password_hash=excluded.password_hash,role='admin',status=1,updated_at=excluded.updated_at",
+         ON CONFLICT(email) DO UPDATE SET role='admin',status=1,updated_at=excluded.updated_at",
     )
     .bind(email)
     .bind(password_hash)
@@ -87,6 +91,7 @@ pub async fn register(
         result.last_insert_rowid(),
         email,
         display_name,
+        String::new(),
         "user".into(),
     )
 }
@@ -96,12 +101,13 @@ pub async fn login(
     Json(input): Json<Credentials>,
 ) -> AppResult<(HeaderMap, Json<Envelope<Value>>)> {
     let email = normalize_email(&input.email)?;
-    let row =
-        sqlx::query("SELECT id,password_hash,display_name,role,status FROM users WHERE email=?")
-            .bind(&email)
-            .fetch_optional(&state.pool)
-            .await?
-            .ok_or(AppError::Unauthorized)?;
+    let row = sqlx::query(
+        "SELECT id,password_hash,display_name,avatar_url,role,status FROM users WHERE email=?",
+    )
+    .bind(&email)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::Unauthorized)?;
     if row.get::<i64, _>("status") != 1
         || !secrets::verify_password(&input.password, row.get("password_hash"))
     {
@@ -112,6 +118,7 @@ pub async fn login(
         row.get("id"),
         email,
         row.get("display_name"),
+        row.get("avatar_url"),
         row.get("role"),
     )
 }
@@ -121,6 +128,7 @@ fn login_response(
     uid: i64,
     email: String,
     display_name: String,
+    avatar_url: String,
     role: String,
 ) -> AppResult<(HeaderMap, Json<Envelope<Value>>)> {
     let token = issue_user_token(state, uid, email.clone(), role.clone())?;
@@ -143,12 +151,32 @@ fn login_response(
             "email": email,
             "nickname": display_name,
             "display_name": display_name,
+            "avatar_url": avatar_url,
             "role": role,
             "token": token,
             "access_token": token,
             "redirect_url": redirect_url
         }))),
     ))
+}
+
+pub async fn account_dispatch(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(path): Path<String>,
+    Json(payload): Json<Value>,
+) -> AppResult<Json<Envelope<Value>>> {
+    let data = match path.trim_matches('/') {
+        "profile" => profile(&state, user.uid).await?,
+        "profile/update" => update_account_profile(&state, user.uid, &payload).await?,
+        "password/update" => update_account_password(&state, user.uid, &payload).await?,
+        path => {
+            return Err(AppError::NotFound(format!(
+                "账户接口不存在: /account-api/{path}"
+            )))
+        }
+    };
+    Ok(Json(Envelope::ok(data)))
 }
 
 pub async fn dispatch(
@@ -165,8 +193,10 @@ pub async fn dispatch(
         "provider/update" => update_provider(&state, user.uid, payload).await?,
         "provider/delete" => delete_provider(&state, user.uid, id(&payload)?).await?,
         "provider/test" => test_provider(&state, user.uid, payload).await?,
+        "provider/models" => provider_models(&state, user.uid, id(&payload)?).await?,
         "model/list" => list_models(&state, user.uid).await?,
         "model/create" => create_model(&state, user.uid, payload).await?,
+        "model/import" => import_models(&state, user.uid, payload).await?,
         "model/update" => update_model(&state, user.uid, payload).await?,
         "model/delete" => delete_model(&state, user.uid, id(&payload)?).await?,
         "key/list" => list_keys(&state, user.uid).await?,
@@ -174,7 +204,22 @@ pub async fn dispatch(
         "key/update" => update_key(&state, user.uid, payload).await?,
         "key/delete" => delete_key(&state, user.uid, id(&payload)?).await?,
         "logs" => list_logs(&state, user.uid, &payload).await?,
-        "stats" => stats(&state, user.uid).await?,
+        "stats" => stats(&state, user.uid, &payload).await?,
+        "sub2api/accounts/api-key" => {
+            crate::sub2api::create_api_key_account(&state, user.uid, &payload).await?
+        }
+        "sub2api/oauth/openai/start" => serde_json::to_value(
+            state
+                .oauth_sessions
+                .start_openai(
+                    user.uid,
+                    payload.get("redirect_uri").and_then(Value::as_str),
+                )
+                .await?,
+        )?,
+        "sub2api/oauth/openai/complete" => {
+            crate::sub2api::complete_openai_oauth(&state, user.uid, &payload).await?
+        }
         _ => {
             return Err(AppError::NotFound(format!(
                 "用户接口不存在: /console/{path}"
@@ -208,21 +253,119 @@ fn id(payload: &Value) -> AppResult<i64> {
 }
 
 async fn profile(state: &AppState, uid: i64) -> AppResult<Value> {
-    let row =
-        sqlx::query("SELECT id,email,display_name,role,status,created_at FROM users WHERE id=?")
-            .bind(uid)
-            .fetch_optional(&state.pool)
-            .await?
-            .ok_or(AppError::Unauthorized)?;
+    let row = sqlx::query(
+        "SELECT id,email,display_name,avatar_url,role,status,created_at FROM users WHERE id=?",
+    )
+    .bind(uid)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::Unauthorized)?;
     Ok(json!({
         "uid": row.get::<i64,_>("id"),
         "email": row.get::<String,_>("email"),
         "display_name": row.get::<String,_>("display_name"),
         "nickname": row.get::<String,_>("display_name"),
+        "avatar_url": row.get::<String,_>("avatar_url"),
         "role": row.get::<String,_>("role"),
         "status": row.get::<i64,_>("status"),
         "create_time": row.get::<i64,_>("created_at")
     }))
+}
+
+async fn update_account_profile(state: &AppState, uid: i64, payload: &Value) -> AppResult<Value> {
+    let row = sqlx::query("SELECT display_name,avatar_url FROM users WHERE id=?")
+        .bind(uid)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+
+    let display_name = if payload.get("display_name").is_some() {
+        let value = string(payload, "display_name");
+        let length = value.chars().count();
+        if !(1..=64).contains(&length) {
+            return Err(AppError::BadRequest(
+                "显示名称长度必须为 1 到 64 个字符".into(),
+            ));
+        }
+        value
+    } else {
+        row.get("display_name")
+    };
+    let avatar_url = if let Some(value) = payload.get("avatar_url") {
+        let value = value
+            .as_str()
+            .ok_or_else(|| AppError::BadRequest("头像数据无效".into()))?;
+        validate_avatar(value)?;
+        value.to_owned()
+    } else {
+        row.get("avatar_url")
+    };
+
+    sqlx::query("UPDATE users SET display_name=?,avatar_url=?,updated_at=? WHERE id=?")
+        .bind(&display_name)
+        .bind(&avatar_url)
+        .bind(store::now())
+        .bind(uid)
+        .execute(&state.pool)
+        .await?;
+    profile(state, uid).await
+}
+
+async fn update_account_password(state: &AppState, uid: i64, payload: &Value) -> AppResult<Value> {
+    let current_password = raw_string(payload, "current_password");
+    let new_password = raw_string(payload, "new_password");
+    validate_password(&new_password)?;
+    let password_hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id=?")
+        .bind(uid)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    if !secrets::verify_password(&current_password, &password_hash) {
+        return Err(AppError::BadRequest("当前密码不正确".into()));
+    }
+    if current_password == new_password {
+        return Err(AppError::BadRequest("新密码不能与当前密码相同".into()));
+    }
+    let new_hash = secrets::hash_password(&new_password)?;
+    sqlx::query("UPDATE users SET password_hash=?,updated_at=? WHERE id=?")
+        .bind(new_hash)
+        .bind(store::now())
+        .bind(uid)
+        .execute(&state.pool)
+        .await?;
+    Ok(json!({}))
+}
+
+fn validate_avatar(value: &str) -> AppResult<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    let encoded = [
+        "data:image/webp;base64,",
+        "data:image/png;base64,",
+        "data:image/jpeg;base64,",
+    ]
+    .iter()
+    .find_map(|prefix| value.strip_prefix(prefix))
+    .ok_or_else(|| AppError::BadRequest("头像必须是 WebP、PNG 或 JPEG 图片".into()))?;
+    if encoded.len() > 350_000 {
+        return Err(AppError::BadRequest("头像不能超过 256KB".into()));
+    }
+    let bytes = STANDARD
+        .decode(encoded)
+        .map_err(|_| AppError::BadRequest("头像数据无效".into()))?;
+    if bytes.is_empty() || bytes.len() > 256 * 1024 {
+        return Err(AppError::BadRequest("头像不能超过 256KB".into()));
+    }
+    Ok(())
+}
+
+fn raw_string(payload: &Value, name: &str) -> String {
+    payload
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn string(payload: &Value, name: &str) -> String {
@@ -356,17 +499,74 @@ async fn delete_provider(state: &AppState, uid: i64, provider_id: i64) -> AppRes
     Ok(json!({}))
 }
 
-async fn test_provider(state: &AppState, uid: i64, payload: Value) -> AppResult<Value> {
-    let provider_id = id(&payload)?;
+async fn provider_models(state: &AppState, uid: i64, provider_id: i64) -> AppResult<Value> {
     let provider = load_provider(state, uid, provider_id).await?;
+    let mut models = if provider.provider_type == "sub2api" {
+        Sub2Repository::new(state.sub2_pool.clone())
+            .model_ids_for_api_key(&provider.api_key)
+            .await?
+    } else {
+        upstream_models(state, &provider).await?
+    };
+    models.sort();
+    models.dedup();
+    if models.is_empty() {
+        return Err(AppError::BadRequest("上游未返回可导入的模型".into()));
+    }
+    Ok(json!({"models":models,"total":models.len()}))
+}
+
+async fn upstream_models(
+    state: &AppState,
+    provider: &ProviderSecret,
+) -> AppResult<Vec<String>> {
     let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
     let mut request = state.client.get(url);
     if !provider.api_key.is_empty() {
-        request = request.bearer_auth(provider.api_key);
+        request = request.bearer_auth(&provider.api_key);
     }
     let response = request.send().await?;
     let status = response.status();
-    Ok(json!({"ok":status.is_success(),"status_code":status.as_u16()}))
+    if !status.is_success() {
+        return Err(AppError::BadRequest(format!(
+            "无法读取上游模型，HTTP {}",
+            status.as_u16()
+        )));
+    }
+    let body: Value = response.json().await?;
+    Ok(body
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 200)
+        .map(str::to_owned)
+        .collect())
+}
+
+async fn test_provider(state: &AppState, uid: i64, payload: Value) -> AppResult<Value> {
+    let provider_id = id(&payload)?;
+    let provider = load_provider(state, uid, provider_id).await?;
+    let ok = if provider.provider_type == "sub2api" {
+        !Sub2Repository::new(state.sub2_pool.clone())
+            .model_ids_for_api_key(&provider.api_key)
+            .await?
+            .is_empty()
+    } else {
+        let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
+        let mut request = state.client.get(url);
+        if !provider.api_key.is_empty() {
+            request = request.bearer_auth(provider.api_key);
+        }
+        request
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
+    };
+    Ok(json!({"ok":ok,"status_code":if ok {200} else {502}}))
 }
 
 pub struct ProviderSecret {
@@ -401,6 +601,124 @@ async fn list_models(state: &AppState, uid: i64) -> AppResult<Value> {
     let rows=sqlx::query("SELECT m.id,m.provider_id,m.alias,m.upstream_model,m.capabilities,m.enabled,m.created_at,m.updated_at,p.name provider_name,p.provider_type FROM user_models m JOIN user_providers p ON p.id=m.provider_id AND p.user_id=m.user_id WHERE m.user_id=? ORDER BY m.id DESC").bind(uid).fetch_all(&state.pool).await?;
     let list=rows.into_iter().map(|row|json!({"id":row.get::<i64,_>("id"),"provider_id":row.get::<i64,_>("provider_id"),"provider_name":row.get::<String,_>("provider_name"),"provider_type":row.get::<String,_>("provider_type"),"alias":row.get::<String,_>("alias"),"upstream_model":row.get::<String,_>("upstream_model"),"capabilities":serde_json::from_str::<Value>(row.get("capabilities")).unwrap_or(json!(["chat"])),"enabled":row.get::<i64,_>("enabled"),"create_time":row.get::<i64,_>("created_at"),"update_time":row.get::<i64,_>("updated_at")})).collect::<Vec<_>>();
     Ok(json!({"list":list,"total":list.len()}))
+}
+
+pub(crate) async fn provision_sub2api_provider(
+    state: &AppState,
+    uid: i64,
+    provider_name: &str,
+    api_key: &str,
+    models: &[String],
+) -> AppResult<Value> {
+    if models.is_empty() {
+        return Err(AppError::BadRequest("Sub2API 分组没有可用模型".into()));
+    }
+    let encrypted = secrets::encrypt(&state.config.encryption_key, api_key)?;
+    let timestamp = store::now();
+    let base_name = provider_name.trim();
+    let duplicate_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_providers WHERE user_id=? AND name LIKE ?")
+            .bind(uid)
+            .bind(format!("{base_name}%"))
+            .fetch_one(&state.pool)
+            .await?;
+    let name = if duplicate_count == 0 {
+        base_name.to_owned()
+    } else {
+        format!("{base_name} {}", duplicate_count + 1)
+    };
+    let mut transaction = state.pool.begin().await?;
+    let provider = sqlx::query("INSERT INTO user_providers(user_id,name,provider_type,base_url,encrypted_api_key,enabled,created_at,updated_at) VALUES(?,?, 'sub2api','http://junohub-server:9003/v1',?,1,?,?)")
+        .bind(uid)
+        .bind(name)
+        .bind(encrypted)
+        .bind(timestamp)
+        .bind(timestamp)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_unique("供应商名称已存在"))?;
+    let provider_id = provider.last_insert_rowid();
+    let mut existing =
+        sqlx::query_scalar::<_, String>("SELECT alias FROM user_models WHERE user_id=?")
+            .bind(uid)
+            .fetch_all(&mut *transaction)
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
+    let mut imported = 0;
+    let mut skipped = 0;
+    for model in models {
+        let model = model.trim();
+        if model.is_empty() || model.len() > 200 || !existing.insert(model.to_owned()) {
+            skipped += 1;
+            continue;
+        }
+        sqlx::query("INSERT INTO user_models(user_id,provider_id,alias,upstream_model,capabilities,enabled,created_at,updated_at) VALUES(?,?,?,?,?,1,?,?)")
+            .bind(uid)
+            .bind(provider_id)
+            .bind(model)
+            .bind(model)
+            .bind("[\"chat\"]")
+            .bind(timestamp)
+            .bind(timestamp)
+            .execute(&mut *transaction)
+            .await?;
+        imported += 1;
+    }
+    transaction.commit().await?;
+    Ok(json!({"provider_id":provider_id,"imported_count":imported,"skipped_count":skipped}))
+}
+
+async fn import_models(state: &AppState, uid: i64, payload: Value) -> AppResult<Value> {
+    let provider_id = payload
+        .get("provider_id")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| AppError::BadRequest("provider_id 不能为空".into()))?;
+    load_provider(state, uid, provider_id).await?;
+    let requested = payload
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::BadRequest("请选择要导入的模型".into()))?;
+    if requested.is_empty() || requested.len() > 200 {
+        return Err(AppError::BadRequest("每次可导入 1 到 200 个模型".into()));
+    }
+    let mut existing =
+        sqlx::query_scalar::<_, String>("SELECT alias FROM user_models WHERE user_id=?")
+            .bind(uid)
+            .fetch_all(&state.pool)
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
+    let timestamp = store::now();
+    let mut imported = Vec::new();
+    let mut skipped = Vec::new();
+    let mut transaction = state.pool.begin().await?;
+    for value in requested {
+        let model = value.as_str().unwrap_or_default().trim();
+        if model.is_empty() || model.len() > 200 {
+            return Err(AppError::BadRequest("模型名称无效".into()));
+        }
+        if !existing.insert(model.to_owned()) {
+            skipped.push(model.to_owned());
+            continue;
+        }
+        sqlx::query("INSERT INTO user_models(user_id,provider_id,alias,upstream_model,capabilities,enabled,created_at,updated_at) VALUES(?,?,?,?,?,1,?,?)")
+            .bind(uid)
+            .bind(provider_id)
+            .bind(model)
+            .bind(model)
+            .bind("[\"chat\"]")
+            .bind(timestamp)
+            .bind(timestamp)
+            .execute(&mut *transaction)
+            .await?;
+        imported.push(model.to_owned());
+    }
+    transaction.commit().await?;
+    Ok(
+        json!({"imported":imported,"skipped":skipped,"imported_count":imported.len(),"skipped_count":skipped.len()}),
+    )
 }
 
 async fn create_model(state: &AppState, uid: i64, payload: Value) -> AppResult<Value> {
@@ -592,7 +910,7 @@ async fn list_logs(state: &AppState, uid: i64, payload: &Value) -> AppResult<Val
     let list=rows.into_iter().map(|r|json!({"id":r.get::<i64,_>("id"),"api_key_id":r.get::<i64,_>("virtual_key_id"),"model_alias":r.get::<String,_>("model_alias"),"upstream_model":r.get::<String,_>("upstream_model"),"provider_type":r.get::<String,_>("provider_type"),"status_code":r.get::<i64,_>("status_code"),"duration_ms":r.get::<i64,_>("duration_ms"),"error_message":r.get::<String,_>("error_message"),"create_time":r.get::<i64,_>("created_at")})).collect::<Vec<_>>();
     Ok(json!({"list":list,"total":total,"page":page,"page_size":size}))
 }
-async fn stats(state: &AppState, uid: i64) -> AppResult<Value> {
+async fn stats(state: &AppState, uid: i64, payload: &Value) -> AppResult<Value> {
     let providers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_providers WHERE user_id=?")
         .bind(uid)
         .fetch_one(&state.pool)
@@ -605,11 +923,19 @@ async fn stats(state: &AppState, uid: i64) -> AppResult<Value> {
         .bind(uid)
         .fetch_one(&state.pool)
         .await?;
-    let requests: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM user_request_logs WHERE user_id=?")
-            .bind(uid)
-            .fetch_one(&state.pool)
-            .await?;
+    let fallback = store::now() - store::now().rem_euclid(86_400);
+    let since = payload
+        .get("since")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0 && *value <= store::now())
+        .unwrap_or(fallback);
+    let requests: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_request_logs WHERE user_id=? AND created_at>=?",
+    )
+    .bind(uid)
+    .bind(since)
+    .fetch_one(&state.pool)
+    .await?;
     Ok(json!({"providers":providers,"models":models,"keys":keys,"requests":requests}))
 }
 
@@ -687,7 +1013,7 @@ mod tests {
 
     use reqwest::Client;
     use serde_json::json;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::{postgres::PgPoolOptions, sqlite::SqlitePoolOptions};
 
     use super::*;
     use crate::config::Config;
@@ -712,6 +1038,11 @@ mod tests {
         }
         AppState {
             pool,
+            sub2_pool: PgPoolOptions::new()
+                .connect_lazy("postgres://sub2api:sub2api@127.0.0.1/sub2api")
+                .unwrap(),
+            sub2_redis: None,
+            oauth_sessions: crate::oauth::OAuthSessionStore::default(),
             config: Arc::new(Config {
                 bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
                 database_url: "sqlite::memory:".into(),
@@ -719,12 +1050,149 @@ mod tests {
                 bootstrap_admin_email: String::new(),
                 bootstrap_admin_password: String::new(),
                 encryption_key: "test-encryption-key".into(),
+                sub2api_admin_email: String::new(),
+                sub2api_database_url: "postgres://sub2api:sub2api@127.0.0.1/sub2api".into(),
+                sub2api_redis_url: "redis://127.0.0.1:6379/0".into(),
+                sub2api_slot_ttl_seconds: 1800,
+                sub2api_wait_ttl_seconds: 120,
+                sub2api_sticky_ttl_seconds: 3600,
+                sub2api_response_sticky_ttl_seconds: 3600,
+                sub2api_session_hash_read_old_fallback: true,
+                sub2api_session_hash_dual_write_old: true,
+                scheduler_worker_enabled: false,
+                account_engine_gateway_enabled: false,
             }),
             client: Client::builder()
                 .timeout(Duration::from_secs(1))
                 .build()
                 .unwrap(),
         }
+    }
+
+    #[test]
+    fn avatar_validation_accepts_supported_small_images() {
+        let encoded = STANDARD.encode([1_u8, 2, 3, 4]);
+        assert!(validate_avatar(&format!("data:image/webp;base64,{encoded}")).is_ok());
+        assert!(validate_avatar("").is_ok());
+        assert!(validate_avatar("data:image/svg+xml;base64,PHN2Zz4=").is_err());
+        assert!(validate_avatar("data:image/png;base64,not-base64").is_err());
+    }
+
+    #[tokio::test]
+    async fn account_profile_and_password_updates_are_persisted() {
+        let state = state().await;
+        let current_hash = secrets::hash_password("current-password").unwrap();
+        sqlx::query("UPDATE users SET password_hash=? WHERE id=1")
+            .bind(current_hash)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let avatar = format!("data:image/webp;base64,{}", STANDARD.encode([1_u8, 2, 3]));
+        let updated = update_account_profile(
+            &state,
+            1,
+            &json!({"display_name":"New Name","avatar_url":avatar}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated["display_name"], "New Name");
+        assert_eq!(updated["avatar_url"], avatar);
+
+        update_account_password(
+            &state,
+            1,
+            &json!({"current_password":"current-password","new_password":"new-password"}),
+        )
+        .await
+        .unwrap();
+        let stored: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id=1")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert!(secrets::verify_password("new-password", &stored));
+        assert!(!secrets::verify_password("current-password", &stored));
+    }
+
+    #[tokio::test]
+    async fn stats_counts_requests_since_the_client_day_start() {
+        let state = state().await;
+        for (user_id, created_at) in [(1_i64, 100_i64), (1, 200), (2, 300)] {
+            sqlx::query("INSERT INTO user_request_logs(user_id,virtual_key_id,model_alias,created_at) VALUES(?,0,'test',?)")
+                .bind(user_id)
+                .bind(created_at)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+        }
+        let result = stats(&state, 1, &json!({"since":150})).await.unwrap();
+        assert_eq!(result["requests"], 1);
+    }
+
+    #[tokio::test]
+    async fn sub2api_provision_creates_one_provider_and_imports_models() {
+        let state = state().await;
+        let result = provision_sub2api_provider(
+            &state,
+            1,
+            "Sub2API · OpenAI",
+            "sub2-secret-key",
+            &["gpt-a".into(), "gpt-b".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["imported_count"], 2);
+        let provider: (String, String) = sqlx::query_as(
+            "SELECT provider_type,encrypted_api_key FROM user_providers WHERE user_id=1",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(provider.0, "sub2api");
+        assert_ne!(provider.1, "sub2-secret-key");
+        assert_eq!(
+            secrets::decrypt(&state.config.encryption_key, &provider.1).unwrap(),
+            "sub2-secret-key"
+        );
+        assert!(provision_sub2api_provider(
+            &state,
+            1,
+            "Sub2API · OpenAI",
+            "another-key",
+            &["gpt-c".into()]
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn model_import_adds_new_aliases_and_skips_duplicates() {
+        let state = state().await;
+        let provider = create_provider(
+            &state,
+            1,
+            json!({"name":"sync","provider_type":"sub2api","base_url":"https://example.com/v1","api_key":"secret"}),
+        )
+        .await
+        .unwrap();
+        let provider_id = provider["id"].as_i64().unwrap();
+        let first = import_models(
+            &state,
+            1,
+            json!({"provider_id":provider_id,"models":["gpt-a","gpt-b"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["imported_count"], 2);
+        let second = import_models(
+            &state,
+            1,
+            json!({"provider_id":provider_id,"models":["gpt-a","gpt-c"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["imported_count"], 1);
+        assert_eq!(second["skipped_count"], 1);
     }
 
     #[tokio::test]

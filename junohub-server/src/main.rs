@@ -4,10 +4,18 @@ mod config;
 mod console;
 mod error;
 mod models;
+mod oauth;
 mod proxy;
 mod secrets;
 mod state;
 mod store;
+mod sub2_domain;
+mod sub2_gateway;
+mod sub2_repository;
+mod sub2_scheduler;
+mod sub2_sticky;
+mod sub2_worker;
+mod sub2api;
 
 use anyhow::Result;
 use axum::{
@@ -19,7 +27,7 @@ use config::Config;
 use models::Envelope;
 use reqwest::Client;
 use serde_json::json;
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::{postgres::PgPoolOptions, sqlite::SqlitePoolOptions};
 use state::AppState;
 use std::{sync::Arc, time::Duration};
 use tower_http::{
@@ -45,19 +53,40 @@ async fn main() -> Result<()> {
         .connect(&config.database_url)
         .await?;
     sqlx::migrate!().run(&pool).await?;
+    let sub2_pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&config.sub2api_database_url)
+        .await?;
+    let redis_client = redis::Client::open(config.sub2api_redis_url.as_str())?;
+    let mut sub2_redis = redis::aio::ConnectionManager::new(redis_client).await?;
+    let pong: String = redis::cmd("PING").query_async(&mut sub2_redis).await?;
+    if pong != "PONG" {
+        anyhow::bail!("Sub2API Redis health check failed");
+    }
     let state = AppState {
         pool,
+        sub2_pool,
+        sub2_redis: Some(sub2_redis),
+        oauth_sessions: oauth::OAuthSessionStore::default(),
         config: Arc::new(config.clone()),
         client: Client::builder()
             .timeout(Duration::from_secs(180))
             .build()?,
     };
     console::ensure_bootstrap_admin(&state).await?;
+    migrate_sub2api_provider_base_urls(&state).await;
+    let _scheduler_worker = sub2_worker::spawn(state.clone());
     let admin_routes = Router::new()
         .route("/{*path}", post(admin::dispatch))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_admin,
+        ));
+    let account_routes = Router::new()
+        .route("/{*path}", post(console::account_dispatch))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_account,
         ));
     let console_routes = Router::new()
         .route("/{*path}", post(console::dispatch))
@@ -73,6 +102,7 @@ async fn main() -> Result<()> {
         .nest("/hub_admin", admin_routes)
         .route("/auth/register", post(console::register))
         .route("/auth/login", post(console::login))
+        .nest("/account-api", account_routes)
         .nest("/console", console_routes)
         .route("/models", get(proxy::models))
         .route("/v1/models", get(proxy::models))
@@ -94,6 +124,27 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown())
         .await?;
     Ok(())
+}
+
+async fn migrate_sub2api_provider_base_urls(state: &AppState) {
+    // 一次性迁移：把指向已删除 Go 网关的存量 base_url 改写为 Rust 引擎自身地址。
+    // 旧地址用 SQL 拼接表达，避免在代码中出现活的 Go 网关引用。
+    let updated = sqlx::query(
+        "UPDATE user_providers SET base_url='http://junohub-server:9003/v1',updated_at=? WHERE provider_type='sub2api' AND base_url LIKE 'http://'||'sub2api'||':8080%'",
+    )
+    .bind(crate::store::now())
+    .execute(&state.pool)
+    .await;
+    match updated {
+        Ok(result) if result.rows_affected() > 0 => {
+            info!(
+                providers = result.rows_affected(),
+                "migrated sub2api provider base_url to Rust account engine"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(error = %error, "failed to migrate sub2api provider base_url"),
+    }
 }
 
 async fn health() -> Json<Envelope<serde_json::Value>> {

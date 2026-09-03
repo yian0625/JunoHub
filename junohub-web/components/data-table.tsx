@@ -40,7 +40,7 @@ export function DataTable<T extends object = Record<string, unknown>>({
 
   return (
     <div className="space-y-4">
-      <div className="overflow-hidden rounded-2xl border border-border-subtle bg-bg-surface shadow-[var(--shadow-surface)]">
+      <div className="overflow-hidden rounded-2xl border border-[var(--glass-border)] bg-[var(--glass-bg)] shadow-[var(--glass-highlight),var(--shadow-surface)] backdrop-blur-2xl backdrop-saturate-150">
         <div className="overflow-x-auto overscroll-x-contain">
           <table className="min-w-[760px] w-full text-sm">
             <thead>

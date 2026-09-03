@@ -5,6 +5,7 @@ interface HubUser {
   uid?: string | number
   nickname?: string
   email?: string
+  avatar_url?: string
   role?: "admin" | "user"
 }
 
@@ -14,6 +15,7 @@ interface AuthState {
   isLoggedIn: boolean
   isReady: boolean
   login: (token: string, user: HubUser) => void
+  updateUser: (user: Partial<HubUser>) => void
   logout: () => void
   init: () => void
 }
@@ -28,6 +30,15 @@ export const useAuthStore = create<AuthState>((set) => ({
     setToken(token)
     setUser(user)
     set({ token, user, isLoggedIn: true, isReady: true })
+  },
+
+  updateUser: (patch: Partial<HubUser>) => {
+    set((state) => {
+      if (!state.user) return state
+      const user = { ...state.user, ...patch }
+      setUser(user)
+      return { user }
+    })
   },
 
   logout: () => {
