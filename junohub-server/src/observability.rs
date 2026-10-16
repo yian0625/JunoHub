@@ -182,7 +182,7 @@ pub fn runtime() -> serde_json::Value {
     #[cfg(target_os = "linux")]
     for family in METRICS.registry.gather() {
         if let Some(metric) = family.get_metric().first() {
-            match family.get_name() {
+            match family.name() {
                 "process_resident_memory_bytes" => {
                     resources["resident_memory_bytes"] =
                         serde_json::json!(metric.get_gauge().get_value())
