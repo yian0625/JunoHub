@@ -1,92 +1,90 @@
 # JunoHub
 
-JunoHub 是一个集成多账户调度能力的多用户 BYOK AI 网关：
+多用户 BYOK AI 网关：统一登录入口、用户控制台、模型路由、账户池调度与用量计费。
 
-- `junohub-web/`：统一登录入口、用户控制台和管理界面，默认端口 `3003`
-- `junohub-server/`：Rust 权限层、模型路由、账户引擎和兼容网关，默认端口 `9003`
-- Rust 账户引擎：账户池、调度、粘性会话、故障切换和上游协议能力（原 Sub2API `v0.1.182` 的 Rust 实现，Go 容器已移除）
-- PostgreSQL / Redis：账户引擎的数据库和缓存，仅在 Compose 内部网络开放，数据保存在 `data/accounts/`
+- `junohub-server/` — Rust 后端：权限层、模型路由、账户引擎、兼容网关（默认 `9003`）
+- `junohub-web/` — Next.js 前端：登录、用户控制台、管理界面（默认 `3003`）
+- PostgreSQL / Redis — 账户引擎的数据面，仅在 Compose 内部网络开放
 
-## Docker 部署
+## 部署
 
-需要 Docker Engine、Docker Compose v2 和 OpenSSL。推荐使用一键脚本：
-
-```bash
-chmod +x deploy.sh
-./deploy.sh up
-```
-
-首次运行会生成一份权限为 `600` 的配置：
-
-- `.env`：JunoHub JWT、加密主密钥、引导管理员，以及账户引擎 PostgreSQL / Redis 凭证
-
-脚本会在终端显示初始管理员密码。请立即保存，并长期备份 `.env` 文件。常用命令：
+需要 Docker Engine、Docker Compose v2 和 OpenSSL。
 
 ```bash
-./deploy.sh status
-./deploy.sh logs
-./deploy.sh restart
-./deploy.sh update
-./deploy.sh down
+./deploy.sh init    # 生成 .env（随机密钥 + 引导管理员密码），会打印初始密码
+./deploy.sh up      # 构建并启动全部服务
+./deploy.sh status  # 查看容器、数据卷、健康状态与备份概览
 ```
 
-部署完成后：
+启动后：
 
-- JunoHub Web：`http://服务器地址:3003`
-- JunoHub OpenAI-compatible API：`http://服务器地址:3003/v1`
-- JunoHub Server：`http://服务器地址:9003`
+- Web 控制台 `http://服务器地址:3003`
+- OpenAI 兼容 API `http://服务器地址:3003/v1`（`Authorization: Bearer <访问密钥>`）
+- 后端直连 `http://服务器地址:9003`
 
-新增账户引擎供应商时，Base URL 指向 Rust 网关自身（Compose 内部地址）：
+首次启动时 `junohub-accounts-postgres` 会用 `deploy/accounts-schema.sql` 初始化账户引擎表结构。
 
-```text
-http://junohub-server:9003/v1
-```
+### 命令一览
 
-首次启动时 `junohub-accounts-postgres` 会使用 `deploy/accounts-schema.sql` 初始化账户引擎表结构（已存在的数据目录不会重复初始化）。
+| 命令 | 作用 |
+| --- | --- |
+| `init` | 生成 `.env`（已存在则不覆盖） |
+| `up` / `down` / `restart` | 启动 / 停止（保留数据）/ 重启 |
+| `update` | 拉取基础镜像、重新构建、滚动启动 |
+| `status` | 容器 + 数据卷 + 健康 + 备份概览 |
+| `backup` | 生成一份**经过校验**的完整备份 |
+| `restore <目录>` | 从备份恢复（会先自动为当前状态留一份快照） |
+| `prune` | 按份数清理旧备份（默认保留 7 份） |
+| `migrate` | 把旧版本留在项目目录里的数据迁移进命名卷 |
+| `doctor` | 环境自检：依赖、端口、权限、磁盘、旧布局残留 |
+| `logs` / `shell` / `config` | 排查用 |
 
-## 数据与备份
+## 数据存放
 
-JunoHub 业务数据保存在 Docker 命名卷 `junohub-data`。账户引擎数据保存在：
+**所有持久化数据都在 Docker 命名卷中，不在项目目录里。**
 
-```text
-data/accounts/postgres/
-data/accounts/redis/
-```
+| 卷 | 内容 | 重要程度 |
+| --- | --- | --- |
+| `junohub-data` | 业务库（SQLite）：用户、访问密钥、模型路由、日志、账单 | 关键 |
+| `junohub-accounts-postgres` | 账户引擎账户池 | 关键 |
+| `junohub-accounts-redis` | 并发槽、粘性会话、限流窗口 | 可重建 |
 
-备份或迁移前应先停止服务：
+`.env` 是配置，也**是加密主密钥**：数据里的供应商凭据用它加密，`.env` 丢了数据就解不开。请长期单独保存。
+
+> 早期版本把 PostgreSQL / Redis 放在项目目录 `data/accounts/` 下。若你是从那个版本升级，执行 `./deploy.sh migrate` 一次性迁移；它会保留原目录为 `data.migrated.<时间戳>`，确认无误后再自行删除。
+
+## 备份与恢复
 
 ```bash
-./deploy.sh down
-tar -czf junohub-backup.tar.gz .env data/accounts
+./deploy.sh backup                        # 备份到 ./backups/<UTC 时间戳>/
+./deploy.sh restore ./backups/<时间戳>     # 恢复（交互确认，可加 --yes）
 ```
 
-`docker compose down` 不会删除这些数据。不要在服务运行时直接复制 PostgreSQL 数据目录，也不要使用 `docker compose down -v` 删除 JunoHub 数据卷。
+`backup` 是在线一致性快照，不需要停服。它**会自己验证**：
 
-## 手动配置
+1. SQLite 通过 `VACUUM INTO` 生成快照（不复制运行中的 WAL），校验文件头、完整性与行数
+2. PostgreSQL 用 `pg_dump --format=custom`
+3. 把 dump 恢复到一个临时库，逐表和线上比对行数
+4. 任一校验失败就删掉这份备份并报错 —— 不会留下一个"看起来像备份"的空壳
 
-也可以手动创建配置：
+备份目录包含 `deployment.env`、`junohub.sqlite`、`accounts.dump`、`manifest.json`（含各产物 sha256 与镜像版本）和 `COMPLETE` 标记。目录权限 `700`，文件 `600`。
+
+`restore` 会先为当前状态自动生成一份 `pre-restore-<时间戳>` 快照，再替换业务库、重建账户池、清空 Redis（只含可重建的调度状态）。全程可用 `--yes` 跳过交互确认。
+
+**不要**在服务运行时直接复制数据库目录，也不要使用 `docker compose down -v`。
+
+### 异地备份
+
+`./backups/` 和 Docker 卷都在同一台机器上，机器坏了就都没了。请把备份目录同步到别处：
 
 ```bash
-cp .env.docker.example .env
-chmod 600 .env
+rsync -a --delete ./backups/ user@backup-host:/srv/junohub-backups/
 ```
 
-必须替换示例中的所有密码和密钥。建议使用：
+## 监控（可选）
 
 ```bash
-openssl rand -hex 32
+docker compose -f compose.yaml -f compose.monitoring.yaml --profile monitoring up -d
 ```
 
-配置完成后运行：
-
-```bash
-docker compose --env-file .env up -d --build --wait
-```
-
-## 本地开发
-
-前端开发时先启动 `junohub-server`。前端通过 `JUNO_HUB_API_URL` 指向服务端；未设置时默认使用 `http://127.0.0.1:9003`。
-
-本地开发账户引擎需要可访问的 PostgreSQL 与 Redis，通过环境变量 `SUB2API_DATABASE_URL` 和 `SUB2API_REDIS_URL` 覆盖（默认主机名 `junohub-accounts-postgres` / `junohub-accounts-redis`）。
-
-迁移状态和兼容边界见 `junohub-server/MIGRATION.md` 与 `junohub-server/SUB2API_RUST_PORT.md`。
+Prometheus 只监听 `127.0.0.1:${JUNOHUB_MONITOR_PORT:-9090}`。`/metrics` 默认仅允许管理员 JWT，可另配 `JUNOHUB_METRICS_TOKEN`。

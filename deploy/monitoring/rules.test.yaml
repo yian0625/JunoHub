@@ -1,0 +1,58 @@
+rule_files: [rules.yaml]
+evaluation_interval: 15s
+tests:
+  - name: backend unavailable independently of application
+    interval: 15s
+    input_series:
+      - series: 'up{job="junohub",instance="junohub-server:9003"}'
+        values: '0+0x12'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: JunoHubMetricsUnavailable
+        exp_alerts:
+          - exp_labels: {job: junohub, instance: 'junohub-server:9003', severity: critical}
+            exp_annotations:
+              summary: JunoHub 后端不可采集
+              description: 后端不可访问或监控凭据失效；检查服务、网络和采集凭据。
+  - name: missing monitor snapshot is detected
+    interval: 15s
+    input_series:
+      - series: 'up{job="junohub",instance="junohub-server:9003"}'
+        values: '1+0x12'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: JunoHubMonitorStale
+        exp_alerts:
+          - exp_labels: {job: junohub, instance: 'junohub-server:9003', severity: critical}
+            exp_annotations: {summary: 站内监控采集停止更新}
+  - name: failures below minimum samples do not trigger traffic alert
+    interval: 15s
+    input_series:
+      - series: 'junohub_http_completed_total{job="junohub",instance="fixture",route="chat_completions",outcome="5xx"}'
+        values: '0+1x30'
+      - series: 'junohub_http_completed_total{job="junohub",instance="fixture",route="chat_completions",outcome="2xx"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: JunoHubServerErrorRate
+        exp_alerts: []
+  - name: unsafe resource references trigger a bounded security alert
+    interval: 15s
+    input_series:
+      - series: 'junohub_security_rejections_total{job="junohub",instance="fixture",reason="unowned_resource"}'
+        values: '0+2x40'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: JunoHubSecurityRejectionSpike
+        exp_alerts:
+          - exp_labels: {reason: unowned_resource, severity: warning}
+            exp_annotations: {summary: '安全拒绝请求增加：unowned_resource'}
+  - name: normal security rejection volume stays quiet
+    interval: 15s
+    input_series:
+      - series: 'junohub_security_rejections_total{job="junohub",instance="fixture",reason="unowned_resource"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: JunoHubSecurityRejectionSpike
+        exp_alerts: []

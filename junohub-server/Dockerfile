@@ -3,10 +3,14 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 COPY migrations ./migrations
+# 只构建发布需要的两个 bin。默认的 `cargo build` 会把 junohub-connect 及其
+# client_adapters（约 4.4 万行）一起编译，白白增加构建时间。
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release \
-    && cp /app/target/release/junohub-server /app/junohub-server
+    touch src/main.rs \
+    && cargo build --release --bin junohub-server --bin junohub-backup \
+    && cp /app/target/release/junohub-server /app/junohub-server \
+    && cp /app/target/release/junohub-backup /app/junohub-backup
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -16,6 +20,7 @@ RUN apt-get update \
     && mkdir -p /data \
     && chown junohub:junohub /data
 COPY --from=builder /app/junohub-server /usr/local/bin/junohub-server
+COPY --from=builder /app/junohub-backup /usr/local/bin/junohub-backup
 WORKDIR /data
 ENV JUNOHUB_BIND=0.0.0.0:9003
 ENV JUNOHUB_DATABASE_URL=sqlite:///data/junohub.db?mode=rwc

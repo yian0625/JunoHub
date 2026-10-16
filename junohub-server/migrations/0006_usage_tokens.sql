@@ -1,0 +1,6 @@
+ALTER TABLE virtual_keys ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE virtual_keys ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE user_request_logs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE user_request_logs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE user_request_logs ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0;

@@ -8,7 +8,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
     return (
       <>
         {children}
-        <Toaster position="top-right" richColors duration={3500} visibleToasts={3} closeButton />
+        <Toaster position="bottom-right" richColors duration={3500} visibleToasts={3} closeButton />
       </>
     )
   }
@@ -16,7 +16,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
   return (
     <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
       {children}
-      <Toaster position="top-right" richColors duration={3500} visibleToasts={3} closeButton />
+      <Toaster position="bottom-right" richColors duration={3500} visibleToasts={3} closeButton />
     </ThemeProvider>
   )
 }

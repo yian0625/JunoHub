@@ -1,0 +1,1 @@
+ALTER TABLE provider_keys ADD COLUMN member_order INTEGER NOT NULL DEFAULT 0 CHECK(member_order BETWEEN 0 AND 1000);

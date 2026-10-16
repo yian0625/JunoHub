@@ -1,0 +1,27 @@
+# Independent, local-only monitoring. Start alongside compose.yaml with --profile monitoring.
+services:
+  junohub-prometheus:
+    image: prom/prometheus:v3.13.4
+    profiles: [monitoring]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.retention.time=30d
+      - --storage.tsdb.retention.size=512MB
+    volumes:
+      - ./deploy/monitoring/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - ./deploy/monitoring/rules.yaml:/etc/prometheus/rules.yaml:ro
+      - ./deploy/monitoring/secrets/metrics-token:/run/secrets/metrics-token:ro
+      - junohub-monitor-data:/prometheus
+    ports:
+      - "127.0.0.1:${JUNOHUB_MONITOR_PORT:-9090}:9090"
+    restart: unless-stopped
+  junohub-blackbox:
+    image: prom/blackbox-exporter:v0.29.0
+    profiles: [monitoring]
+    command: [--config.file=/etc/blackbox/blackbox.yaml]
+    volumes:
+      - ./deploy/monitoring/blackbox.yaml:/etc/blackbox/blackbox.yaml:ro
+    restart: unless-stopped
+volumes:
+  junohub-monitor-data:
+    name: junohub-monitor-data

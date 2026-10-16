@@ -5,7 +5,10 @@ use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::error::{AppError, AppResult};
+use crate::{
+    error::{AppError, AppResult},
+    secrets,
+};
 
 #[derive(Clone, Debug, FromRow, Serialize)]
 pub struct EngineAccount {
@@ -109,6 +112,49 @@ pub struct CreatedBundle {
     pub api_key: String,
 }
 
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct ManagedAccountSummary {
+    pub id: i64,
+    pub name: String,
+    pub platform: String,
+    pub kind: String,
+    pub priority: i32,
+    pub member_order: i32,
+    pub weight: i32,
+    pub concurrency: i32,
+    pub allowed_models: Vec<String>,
+    pub rpm: i32,
+    pub health: String,
+    pub cooldown_until: Option<i64>,
+    pub status: String,
+    pub schedulable: bool,
+    pub base_url: Option<String>,
+    pub has_api_key: bool,
+    pub oauth_type: Option<String>,
+    pub project_id: Option<String>,
+    pub client_id: Option<String>,
+    pub has_client_secret: bool,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct ManagedAccountRow {
+    id: i64,
+    name: String,
+    platform: String,
+    kind: String,
+    priority: i32,
+    member_order: i32,
+    weight: i32,
+    concurrency: i32,
+    allowed_models: Vec<String>,
+    rpm: i32,
+    health: String,
+    cooldown_until: Option<i64>,
+    status: String,
+    schedulable: bool,
+    credentials: Value,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct EngineSnapshot {
     pub accounts: i64,
@@ -168,6 +214,48 @@ pub struct Sub2Repository {
 impl Sub2Repository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub async fn protect_plaintext_credentials(&self, encryption_key: &str) -> AppResult<u64> {
+        let rows = sqlx::query_as::<_, (i64, Value)>(
+            "SELECT id,credentials FROM accounts WHERE deleted_at IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut updated = 0;
+        for (id, credentials) in rows {
+            let protected = secrets::protect_credentials(encryption_key, &credentials)?;
+            if protected == credentials {
+                continue;
+            }
+            updated +=
+                sqlx::query("UPDATE accounts SET credentials=$1,updated_at=NOW() WHERE id=$2")
+                    .bind(protected)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?
+                    .rows_affected();
+        }
+        Ok(updated)
+    }
+
+    /// 报告“名字像密钥、却仍是明文”的字段，供启动自检使用。
+    ///
+    /// 只返回账号 id 和**字段名**，不返回值：告警要能进日志，但不能把密钥
+    /// 本身写进日志。
+    pub async fn audit_plaintext_credentials(&self) -> AppResult<Vec<(i64, Vec<String>)>> {
+        let rows = sqlx::query_as::<_, (i64, Value)>(
+            "SELECT id,credentials FROM accounts WHERE deleted_at IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, credentials)| {
+                let fields = secrets::unprotected_sensitive_fields(&credentials);
+                (!fields.is_empty()).then_some((id, fields))
+            })
+            .collect())
     }
 
     pub async fn verify_outbox_cleanup_rollback(&self) -> AppResult<OutboxCleanupProbe> {
@@ -320,17 +408,35 @@ impl Sub2Repository {
         account_id: i64,
         old_refresh_token: &str,
         token_patch: &Value,
+        encryption_key: &str,
     ) -> AppResult<bool> {
         let mut transaction = self.pool.begin().await?;
-        let updated: Option<i64> = sqlx::query_scalar(
-            "UPDATE accounts SET credentials=COALESCE(credentials,'{}'::jsonb)||$1,updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL AND credentials->>'refresh_token'=$3 RETURNING id",
+        let current: Option<Value> = sqlx::query_scalar(
+            "SELECT credentials FROM accounts WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
         )
-        .bind(token_patch)
         .bind(account_id)
-        .bind(old_refresh_token)
         .fetch_optional(&mut *transaction)
         .await?;
-        if updated.is_some() {
+        let matches_refresh_token = current
+            .as_ref()
+            .map(|credentials| secrets::reveal_credentials(encryption_key, credentials))
+            .transpose()?
+            .and_then(|credentials| {
+                credentials
+                    .get("refresh_token")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .is_some_and(|current| current == old_refresh_token);
+        if matches_refresh_token {
+            let protected_patch = secrets::protect_credentials(encryption_key, token_patch)?;
+            sqlx::query(
+                "UPDATE accounts SET credentials=COALESCE(credentials,'{}'::jsonb)||$1,updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL",
+            )
+            .bind(protected_patch)
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await?;
             let group_ids: Vec<i64> = sqlx::query_scalar(
                 "SELECT group_id FROM account_groups WHERE account_id=$1 ORDER BY priority,group_id",
             )
@@ -348,7 +454,7 @@ impl Sub2Repository {
             .await?;
         }
         transaction.commit().await?;
-        Ok(updated.is_some())
+        Ok(matches_refresh_token)
     }
 
     pub async fn touch_account_last_used(&self, account_id: i64) -> AppResult<()> {
@@ -363,8 +469,7 @@ impl Sub2Repository {
         .bind(account_id)
         .execute(&mut *transaction)
         .await?;
-        let payload =
-            serde_json::json!({"last_used":{account_id.to_string():timestamp}});
+        let payload = serde_json::json!({"last_used":{account_id.to_string():timestamp}});
         enqueue_scheduler_event(
             &mut transaction,
             "account_last_used",
@@ -374,6 +479,129 @@ impl Sub2Repository {
         )
         .await?;
         transaction.commit().await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_usage(
+        &self,
+        engine_api_key: &str,
+        account_id: i64,
+        requested_model: &str,
+        upstream_model: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        duration_ms: i64,
+        stream: bool,
+    ) -> AppResult<()> {
+        if account_id <= 0 {
+            return Ok(());
+        }
+        let route = self.resolve_engine_key(engine_api_key).await?;
+        let requested_model = requested_model.chars().take(100).collect::<String>();
+        let upstream_model = upstream_model.chars().take(100).collect::<String>();
+        let input_tokens = input_tokens.clamp(0, i32::MAX as i64) as i32;
+        let output_tokens = output_tokens.clamp(0, i32::MAX as i64) as i32;
+        let duration_ms = duration_ms.clamp(0, i32::MAX as i64) as i32;
+        let request_id = uuid::Uuid::new_v4().simple().to_string();
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO usage_logs(user_id,api_key_id,account_id,request_id,model,input_tokens,output_tokens,stream,duration_ms,group_id,requested_model,upstream_model,inbound_endpoint,billing_type,request_type) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'junohub',0,0)",
+        )
+        .bind(route.user_id)
+        .bind(route.api_key_id)
+        .bind(account_id)
+        .bind(request_id)
+        .bind(&upstream_model)
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(stream)
+        .bind(duration_ms)
+        .bind(route.group_id)
+        .bind(&requested_model)
+        .bind(&upstream_model)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("UPDATE api_keys SET last_used_at=NOW(),updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL")
+            .bind(route.api_key_id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn record_account_failure(
+        &self,
+        account_id: i64,
+        status: Option<u16>,
+        reason: &str,
+        retry_after_seconds: i64,
+    ) -> AppResult<()> {
+        if account_id <= 0 {
+            return Ok(());
+        }
+        let cooldown = retry_after_seconds.clamp(5, 3600);
+        let mut transaction = self.pool.begin().await?;
+        match status {
+            Some(429) => {
+                sqlx::query(
+                    "UPDATE accounts SET rate_limited_at=NOW(),rate_limit_reset_at=NOW()+($1*INTERVAL '1 second'),error_message=$2,updated_at=NOW() WHERE id=$3 AND deleted_at IS NULL",
+                )
+                .bind(cooldown)
+                .bind(reason)
+                .bind(account_id)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            Some(code) if code >= 500 => {
+                sqlx::query(
+                    "UPDATE accounts SET overload_until=NOW()+($1*INTERVAL '1 second'),error_message=$2,updated_at=NOW() WHERE id=$3 AND deleted_at IS NULL",
+                )
+                .bind(cooldown)
+                .bind(reason)
+                .bind(account_id)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            _ => {
+                sqlx::query(
+                    "UPDATE accounts SET temp_unschedulable_until=NOW()+($1*INTERVAL '1 second'),temp_unschedulable_reason=$2,error_message=$2,updated_at=NOW() WHERE id=$3 AND deleted_at IS NULL",
+                )
+                .bind(cooldown)
+                .bind(reason)
+                .bind(account_id)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+        let group_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT group_id FROM account_groups WHERE account_id=$1 ORDER BY group_id",
+        )
+        .bind(account_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        enqueue_scheduler_event(
+            &mut transaction,
+            "account_changed",
+            Some(account_id),
+            None,
+            Some(&serde_json::json!({"group_ids":group_ids})),
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn clear_account_failure(&self, account_id: i64) -> AppResult<()> {
+        if account_id <= 0 {
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE accounts SET error_message=NULL,temp_unschedulable_until=NULL,temp_unschedulable_reason=NULL,updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL AND (error_message IS NOT NULL OR temp_unschedulable_until IS NOT NULL)",
+        )
+        .bind(account_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -412,7 +640,7 @@ impl Sub2Repository {
         .fetch_one(&self.pool)
         .await?;
         let credentials: Vec<Value> = sqlx::query_scalar(
-            "SELECT a.credentials FROM account_groups ag JOIN accounts a ON a.id=ag.account_id WHERE ag.group_id=$1 AND a.deleted_at IS NULL AND a.status='active' AND a.schedulable=true ORDER BY ag.priority,a.priority,a.id",
+            "SELECT a.credentials FROM account_groups ag JOIN accounts a ON a.id=ag.account_id WHERE ag.group_id=$1 AND ag.priority>0 AND a.deleted_at IS NULL AND a.status='active' AND a.schedulable=true ORDER BY ag.priority,a.priority,a.id",
         )
         .bind(group_id)
         .fetch_all(&self.pool)
@@ -457,7 +685,7 @@ impl Sub2Repository {
         };
         let rows = if group_id > 0 {
             sqlx::query_scalar::<_, i64>(
-                "SELECT a.id FROM account_groups ag JOIN accounts a ON a.id=ag.account_id WHERE ag.group_id=$1 AND a.deleted_at IS NULL AND a.status='active' AND a.schedulable=true AND a.platform=ANY($2) AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until<=NOW()) AND (a.expires_at IS NULL OR a.expires_at>NOW() OR a.auto_pause_on_expired=false) AND (a.overload_until IS NULL OR a.overload_until<=NOW()) AND (a.rate_limit_reset_at IS NULL OR a.rate_limit_reset_at<=NOW()) AND (a.platform<>'antigravity' OR COALESCE((a.extra->>'mixed_scheduling')::boolean,false)=true OR $3=false) ORDER BY ag.priority,a.priority,a.id",
+                "SELECT a.id FROM account_groups ag JOIN accounts a ON a.id=ag.account_id WHERE ag.group_id=$1 AND ag.priority>0 AND a.deleted_at IS NULL AND a.status='active' AND a.schedulable=true AND a.platform=ANY($2) AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until<=NOW()) AND (a.expires_at IS NULL OR a.expires_at>NOW() OR a.auto_pause_on_expired=false) AND (a.overload_until IS NULL OR a.overload_until<=NOW()) AND (a.rate_limit_reset_at IS NULL OR a.rate_limit_reset_at<=NOW()) AND (a.platform<>'antigravity' OR COALESCE((a.extra->>'mixed_scheduling')::boolean,false)=true OR $3=false) ORDER BY ag.priority,a.priority,a.id",
             )
             .bind(group_id)
             .bind(&platforms)
@@ -596,9 +824,10 @@ impl Sub2Repository {
         .bind(input.priority)
         .fetch_one(&mut *transaction)
         .await?;
-        sqlx::query("INSERT INTO account_groups(account_id,group_id,priority) VALUES($1,$2,50)")
+        sqlx::query("INSERT INTO account_groups(account_id,group_id,priority) VALUES($1,$2,$3)")
             .bind(account_id)
             .bind(group_id)
+            .bind(input.priority)
             .execute(&mut *transaction)
             .await?;
         let account_payload = serde_json::json!({"group_ids":[group_id]});
@@ -627,6 +856,466 @@ impl Sub2Repository {
             api_key_id,
             api_key,
         })
+    }
+
+    pub async fn add_account_to_group(
+        &self,
+        group_id: i64,
+        input: CreateBundleInput,
+    ) -> AppResult<i64> {
+        if group_id <= 0
+            || input.account_name.trim().is_empty()
+            || input.platform.trim().is_empty()
+            || input.kind.trim().is_empty()
+            || input.concurrency < 0
+        {
+            return Err(AppError::BadRequest("账户创建参数无效".into()));
+        }
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(group_id)
+            .execute(&mut *transaction)
+            .await?;
+        let duplicate: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts a JOIN account_groups ag ON ag.account_id=a.id WHERE ag.group_id=$1 AND a.deleted_at IS NULL AND lower(trim(a.name))=lower($2) AND a.id<>$3)").bind(group_id).bind(input.account_name.trim()).bind(0_i64).fetch_one(&mut *transaction).await?;
+        if duplicate {
+            return Err(AppError::BadRequest(
+                "此供应商下已有同名账户，请换一个名称".into(),
+            ));
+        }
+
+        let platform: Option<String> = sqlx::query_scalar(
+            "SELECT platform FROM groups WHERE id=$1 AND deleted_at IS NULL AND status='active' FOR UPDATE",
+        )
+        .bind(group_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if platform.as_deref() != Some(input.platform.trim()) {
+            return Err(AppError::BadRequest("账户平台与目标账户池不一致".into()));
+        }
+        let priority: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(a.priority),0)+1 FROM accounts a JOIN account_groups ag ON ag.account_id=a.id WHERE ag.group_id=$1 AND a.deleted_at IS NULL",
+        )
+        .bind(group_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let account_id: i64 = sqlx::query_scalar(
+            "INSERT INTO accounts(name,notes,platform,type,credentials,extra,concurrency,priority,status,schedulable,rate_multiplier,auto_pause_on_expired) VALUES($1,'Managed by JunoHub Rust engine',$2,$3,$4,$5,$6,$7,'active',true,1,true) RETURNING id",
+        )
+        .bind(input.account_name.trim())
+        .bind(input.platform.trim())
+        .bind(input.kind.trim())
+        .bind(input.credentials)
+        .bind(input.extra)
+        .bind(input.concurrency)
+        .bind(priority)
+        .fetch_one(&mut *transaction)
+        .await?;
+        sqlx::query("INSERT INTO account_groups(account_id,group_id,priority) VALUES($1,$2,$3)")
+            .bind(account_id)
+            .bind(group_id)
+            .bind(priority)
+            .execute(&mut *transaction)
+            .await?;
+        let payload = serde_json::json!({"group_ids":[group_id]});
+        enqueue_scheduler_event(
+            &mut transaction,
+            "account_changed",
+            Some(account_id),
+            None,
+            Some(&payload),
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(account_id)
+    }
+
+    pub async fn managed_accounts(
+        &self,
+        group_id: i64,
+        encryption_key: &str,
+    ) -> AppResult<Vec<ManagedAccountSummary>> {
+        if group_id <= 0 {
+            return Err(AppError::BadRequest("账户池标识无效".into()));
+        }
+        let rows = sqlx::query_as::<_, ManagedAccountRow>(
+            "SELECT a.id,a.name,a.platform,a.type AS kind,ag.priority,COALESCE((a.extra->>'junohub_order')::integer,0) AS member_order,COALESCE((a.extra->>'junohub_rpm')::integer,0) AS rpm,COALESCE((a.extra->>'junohub_weight')::integer,1) AS weight,CASE WHEN a.load_factor>0 THEN a.load_factor ELSE a.concurrency END AS concurrency,ARRAY(SELECT jsonb_array_elements_text(COALESCE(a.extra->'junohub_models','[]'::jsonb))) AS allowed_models,CASE WHEN a.status<>'active' OR NOT a.schedulable THEN 'disabled' WHEN a.auto_pause_on_expired AND a.expires_at<=NOW() THEN 'expired' WHEN a.rate_limit_reset_at>NOW() THEN 'rate_limited' WHEN GREATEST(a.overload_until,a.temp_unschedulable_until)>NOW() THEN 'cooling' ELSE 'ready' END AS health,EXTRACT(EPOCH FROM GREATEST(a.rate_limit_reset_at,a.overload_until,a.temp_unschedulable_until))::bigint AS cooldown_until,a.status,a.schedulable,a.credentials FROM account_groups ag JOIN accounts a ON a.id=ag.account_id WHERE ag.group_id=$1 AND a.deleted_at IS NULL ORDER BY ag.priority,a.priority,a.id",
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let credentials = secrets::reveal_credentials(encryption_key, &row.credentials)?;
+                Ok(ManagedAccountSummary {
+                    id: row.id,
+                    name: row.name,
+                    platform: row.platform,
+                    kind: row.kind,
+                    priority: row.priority,
+                    member_order: row.member_order,
+                    weight: row.weight,
+                    concurrency: row.concurrency,
+                    allowed_models: row.allowed_models,
+                    rpm: row.rpm,
+                    health: row.health,
+                    cooldown_until: row.cooldown_until,
+                    status: row.status,
+                    schedulable: row.schedulable && row.priority > 0,
+                    base_url: credentials
+                        .get("base_url")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    has_api_key: credentials
+                        .get("api_key")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty()),
+                    oauth_type: credentials
+                        .get("oauth_type")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    project_id: credentials
+                        .get("project_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    client_id: credentials
+                        .get("client_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    has_client_secret: credentials
+                        .get("client_secret")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty()),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn dispatch_accounts(
+        &self,
+        group_id: i64,
+    ) -> AppResult<Vec<crate::sub2_policy::AccountDispatch>> {
+        Ok(sqlx::query_as("SELECT a.id,ag.priority,COALESCE((a.extra->>'junohub_order')::integer,0) AS member_order,COALESCE((a.extra->>'junohub_rpm')::integer,0) AS rpm,COALESCE((a.extra->>'junohub_weight')::integer,1) AS weight,a.concurrency,ARRAY(SELECT jsonb_array_elements_text(COALESCE(a.extra->'junohub_models','[]'::jsonb))) AS allowed_models FROM accounts a JOIN account_groups ag ON ag.account_id=a.id WHERE ag.group_id=$1 AND a.deleted_at IS NULL ORDER BY ag.priority,a.id")
+            .bind(group_id).fetch_all(&self.pool).await?)
+    }
+    pub async fn update_account_dispatch(
+        &self,
+        group_id: i64,
+        accounts: &[crate::sub2_policy::AccountDispatch],
+    ) -> AppResult<()> {
+        crate::sub2_policy::validate_accounts(accounts)?;
+        let mut transaction = self.pool.begin().await?;
+        let mut ordered: Vec<_> = accounts.iter().collect();
+        ordered.sort_by_key(|a| a.id);
+        for account in ordered {
+            let result = sqlx::query("UPDATE accounts SET priority=$1,concurrency=$2,load_factor=NULL,extra=jsonb_set(jsonb_set(jsonb_set(COALESCE(extra,'{}'::jsonb),'{junohub_weight}',to_jsonb($3::integer)),'{junohub_models}',$6::jsonb),'{junohub_rpm}',to_jsonb($7::integer)),updated_at=NOW() WHERE id=$4 AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM account_groups WHERE account_id=$4 AND group_id=$5)")
+                .bind(account.priority).bind(account.concurrency).bind(account.weight).bind(account.id).bind(group_id).bind(serde_json::json!(account.allowed_models)).bind(account.rpm).execute(&mut *transaction).await?;
+            if result.rows_affected() != 1 {
+                return Err(AppError::NotFound(
+                    "账户不存在或不属于此供应商，未保存任何修改".into(),
+                ));
+            }
+            sqlx::query("UPDATE accounts SET extra=jsonb_set(COALESCE(extra,'{}'::jsonb),'{junohub_order}',to_jsonb($1::integer)) WHERE id=$2").bind(account.member_order).bind(account.id).execute(&mut *transaction).await?;
+            sqlx::query(
+                "UPDATE account_groups SET priority=$1 WHERE account_id=$2 AND group_id=$3",
+            )
+            .bind(account.priority)
+            .bind(account.id)
+            .bind(group_id)
+            .execute(&mut *transaction)
+            .await?;
+            enqueue_scheduler_event(
+                &mut transaction,
+                "account_changed",
+                Some(account.id),
+                None,
+                Some(&serde_json::json!({"group_ids":[group_id]})),
+            )
+            .await?;
+        }
+        enqueue_scheduler_event(
+            &mut transaction,
+            "group_changed",
+            None,
+            Some(group_id),
+            None,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn update_managed_account_priorities(
+        &self,
+        group_id: i64,
+        updates: &[(i64, i32)],
+    ) -> AppResult<()> {
+        if group_id <= 0
+            || updates.is_empty()
+            || updates.len() > 100
+            || updates
+                .iter()
+                .any(|(account_id, priority)| *account_id <= 0 || !(1..=999).contains(priority))
+        {
+            return Err(AppError::BadRequest("账户优先级参数无效".into()));
+        }
+        let mut transaction = self.pool.begin().await?;
+        for &(account_id, priority) in updates {
+            let result = sqlx::query(
+                "UPDATE accounts SET priority=$1,updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM account_groups WHERE account_id=$2 AND group_id=$3)",
+            )
+            .bind(priority)
+            .bind(account_id)
+            .bind(group_id)
+            .execute(&mut *transaction)
+            .await?;
+            if result.rows_affected() == 0 {
+                return Err(AppError::NotFound("账户不存在或不属于该供应商".into()));
+            }
+            sqlx::query(
+                "UPDATE account_groups SET priority=$1 WHERE account_id=$2 AND group_id=$3",
+            )
+            .bind(priority)
+            .bind(account_id)
+            .bind(group_id)
+            .execute(&mut *transaction)
+            .await?;
+            enqueue_scheduler_event(
+                &mut transaction,
+                "account_changed",
+                Some(account_id),
+                None,
+                Some(&serde_json::json!({"group_ids":[group_id]})),
+            )
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn update_managed_account_config(
+        &self,
+        group_id: i64,
+        account_id: i64,
+        name: &str,
+        base_url: Option<&str>,
+        api_key: Option<&str>,
+        encryption_key: &str,
+    ) -> AppResult<()> {
+        let name = name.trim();
+        if group_id <= 0 || account_id <= 0 || name.is_empty() || name.chars().count() > 200 {
+            return Err(AppError::BadRequest("账户配置参数无效".into()));
+        }
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(group_id)
+            .execute(&mut *transaction)
+            .await?;
+        let duplicate: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts a JOIN account_groups ag ON ag.account_id=a.id WHERE ag.group_id=$1 AND a.deleted_at IS NULL AND lower(trim(a.name))=lower($2) AND a.id<>$3)").bind(group_id).bind(name).bind(account_id).fetch_one(&mut *transaction).await?;
+        if duplicate {
+            return Err(AppError::BadRequest(
+                "此供应商下已有同名账户，请换一个名称".into(),
+            ));
+        }
+
+        let row = sqlx::query_as::<_, (String, Value)>(
+            "SELECT a.type,a.credentials FROM accounts a JOIN account_groups ag ON ag.account_id=a.id WHERE a.id=$1 AND ag.group_id=$2 AND a.deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(account_id)
+        .bind(group_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| AppError::NotFound("账户不存在或不属于该供应商".into()))?;
+        let credentials = if row.0 == "apikey" {
+            let base_url = base_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::BadRequest("API Key 账户必须填写 Base URL".into()))?;
+            let url = reqwest::Url::parse(base_url)
+                .map_err(|_| AppError::BadRequest("Base URL 无效".into()))?;
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                return Err(AppError::BadRequest("Base URL 必须是 HTTP(S) 地址".into()));
+            }
+            let mut credentials = secrets::reveal_credentials(encryption_key, &row.1)?;
+            let object = credentials
+                .as_object_mut()
+                .ok_or_else(|| AppError::Internal("账户凭证格式无效".into()))?;
+            object.insert(
+                "base_url".into(),
+                Value::String(base_url.trim_end_matches('/').to_owned()),
+            );
+            if let Some(api_key) = api_key.map(str::trim).filter(|value| !value.is_empty()) {
+                if api_key.len() > 8192 {
+                    return Err(AppError::BadRequest("API Key 长度无效".into()));
+                }
+                object.insert("api_key".into(), Value::String(api_key.to_owned()));
+            }
+            secrets::protect_credentials(encryption_key, &credentials)?
+        } else {
+            row.1
+        };
+        sqlx::query(
+            "UPDATE accounts SET name=$1,credentials=$2,updated_at=NOW() WHERE id=$3 AND deleted_at IS NULL",
+        )
+        .bind(name)
+        .bind(credentials)
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await?;
+        enqueue_scheduler_event(
+            &mut transaction,
+            "account_changed",
+            Some(account_id),
+            None,
+            Some(&serde_json::json!({"group_ids":[group_id]})),
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn replace_managed_oauth_credentials(
+        &self,
+        group_id: i64,
+        account_id: i64,
+        platform: &str,
+        name: &str,
+        credentials: Value,
+        extra: Value,
+    ) -> AppResult<()> {
+        let platform = platform.trim();
+        let name = name.trim();
+        if group_id <= 0
+            || account_id <= 0
+            || platform.is_empty()
+            || name.is_empty()
+            || name.chars().count() > 200
+        {
+            return Err(AppError::BadRequest("OAuth 账户配置参数无效".into()));
+        }
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(group_id)
+            .execute(&mut *transaction)
+            .await?;
+        let duplicate: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts a JOIN account_groups ag ON ag.account_id=a.id WHERE ag.group_id=$1 AND a.deleted_at IS NULL AND lower(trim(a.name))=lower($2) AND a.id<>$3)").bind(group_id).bind(name).bind(account_id).fetch_one(&mut *transaction).await?;
+        if duplicate {
+            return Err(AppError::BadRequest(
+                "此供应商下已有同名账户，请换一个名称".into(),
+            ));
+        }
+
+        let result = sqlx::query(
+            "UPDATE accounts SET name=$1,credentials=$2,extra=COALESCE(extra,'{}'::jsonb) || $3 || jsonb_strip_nulls(jsonb_build_object('junohub_order',extra->'junohub_order','junohub_weight',extra->'junohub_weight','junohub_rpm',extra->'junohub_rpm','junohub_models',extra->'junohub_models')),status='active',schedulable=true,error_message=NULL,rate_limited_at=NULL,rate_limit_reset_at=NULL,overload_until=NULL,temp_unschedulable_until=NULL,temp_unschedulable_reason=NULL,updated_at=NOW() WHERE id=$4 AND platform=$5 AND type='oauth' AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM account_groups WHERE account_id=$4 AND group_id=$6)",
+        )
+        .bind(name)
+        .bind(credentials)
+        .bind(extra)
+        .bind(account_id)
+        .bind(platform)
+        .bind(group_id)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound(
+                "OAuth 账户不存在或不属于该供应商".into(),
+            ));
+        }
+        enqueue_scheduler_event(
+            &mut transaction,
+            "account_changed",
+            Some(account_id),
+            None,
+            Some(&serde_json::json!({"group_ids":[group_id]})),
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn delete_managed_account(&self, group_id: i64, account_id: i64) -> AppResult<()> {
+        let mut transaction = self.pool.begin().await?;
+        // Lock the account before unlinking it. Shared accounts remain available to other groups.
+        let account: Option<i64> = sqlx::query_scalar("SELECT a.id FROM accounts a WHERE a.id=$1 AND a.deleted_at IS NULL AND EXISTS(SELECT 1 FROM account_groups WHERE account_id=a.id AND group_id=$2) FOR UPDATE")
+            .bind(account_id).bind(group_id).fetch_optional(&mut *transaction).await?;
+        if account.is_none() {
+            return Err(AppError::NotFound("账户不存在或不属于此供应商".into()));
+        }
+        sqlx::query("DELETE FROM account_groups WHERE account_id=$1 AND group_id=$2")
+            .bind(account_id)
+            .bind(group_id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE accounts SET schedulable=false,credentials='{}'::jsonb,deleted_at=NOW(),updated_at=NOW() WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM account_groups WHERE account_id=$1)")
+            .bind(account_id).execute(&mut *transaction).await?;
+        enqueue_scheduler_event(
+            &mut transaction,
+            "account_changed",
+            Some(account_id),
+            None,
+            Some(&serde_json::json!({"group_ids":[group_id]})),
+        )
+        .await?;
+        enqueue_scheduler_event(
+            &mut transaction,
+            "group_changed",
+            None,
+            Some(group_id),
+            None,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn delete_managed_pool(&self, group_id: i64, api_key_id: i64) -> AppResult<()> {
+        if group_id <= 0 || api_key_id <= 0 {
+            return Err(AppError::BadRequest("账户池资源标识无效".into()));
+        }
+        let mut transaction = self.pool.begin().await?;
+        let account_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT account_id FROM account_groups WHERE group_id=$1 ORDER BY account_id",
+        )
+        .bind(group_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        sqlx::query("UPDATE api_keys SET key=$1,deleted_at=NOW(),updated_at=NOW() WHERE id=$2 AND group_id=$3 AND deleted_at IS NULL")
+            .bind(format!("__deleted__{}__{}", api_key_id, Utc::now().timestamp_nanos_opt().unwrap_or_default()))
+            .bind(api_key_id)
+            .bind(group_id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM account_groups WHERE group_id=$1")
+            .bind(group_id)
+            .execute(&mut *transaction)
+            .await?;
+        for account_id in account_ids {
+            sqlx::query("UPDATE accounts SET schedulable=false,deleted_at=NOW(),updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL")
+                .bind(account_id)
+                .execute(&mut *transaction)
+                .await?;
+            enqueue_scheduler_event(
+                &mut transaction,
+                "account_changed",
+                Some(account_id),
+                None,
+                Some(&serde_json::json!({"group_ids":[group_id]})),
+            )
+            .await?;
+        }
+        sqlx::query("UPDATE groups SET deleted_at=NOW(),updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL")
+            .bind(group_id)
+            .execute(&mut *transaction)
+            .await?;
+        enqueue_scheduler_event(
+            &mut transaction,
+            "group_changed",
+            None,
+            Some(group_id),
+            None,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub async fn delete_bundle(&self, bundle: &CreatedBundle) -> AppResult<()> {
@@ -820,6 +1509,16 @@ fn default_model_ids(platform: &str) -> &'static [&'static str] {
             "claude-sonnet-4-5-20250929",
             "claude-haiku-4-5-20251001",
         ],
+        "grok" => &["grok-code-fast-1", "grok-4", "grok-4-fast", "grok-4-1-fast"],
+        "antigravity" => &[
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-3-flash-preview",
+            "gemini-3-pro-preview",
+            "gemini-3.1-pro-preview",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+        ],
         _ => &[],
     }
 }
@@ -987,6 +1686,182 @@ async fn enqueue_scheduler_event(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL instance via JUNOHUB_TEST_POSTGRES_URL"]
+    async fn delete_account_is_scoped_and_preserves_shared_accounts() {
+        let url = std::env::var("JUNOHUB_TEST_POSTGRES_URL").expect("isolated test PostgreSQL URL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TEMP TABLE accounts(id BIGINT PRIMARY KEY,name TEXT DEFAULT 'fixture',platform TEXT DEFAULT 'openai',type TEXT DEFAULT 'apikey',priority INTEGER DEFAULT 1,concurrency INTEGER DEFAULT 1,load_factor INTEGER,extra JSONB DEFAULT '{}'::jsonb,status TEXT DEFAULT 'active',expires_at TIMESTAMPTZ,auto_pause_on_expired BOOLEAN DEFAULT true,rate_limit_reset_at TIMESTAMPTZ,overload_until TIMESTAMPTZ,temp_unschedulable_until TIMESTAMPTZ,schedulable BOOLEAN DEFAULT true,credentials JSONB DEFAULT '{}'::jsonb,deleted_at TIMESTAMPTZ,updated_at TIMESTAMPTZ); CREATE TEMP TABLE account_groups(account_id BIGINT,group_id BIGINT,priority INTEGER DEFAULT 1); CREATE TEMP TABLE scheduler_outbox(event_type TEXT,account_id BIGINT,group_id BIGINT,payload JSONB,dedup_key TEXT); CREATE UNIQUE INDEX test_dedup ON scheduler_outbox(dedup_key) WHERE dedup_key IS NOT NULL; INSERT INTO accounts(id,credentials) VALUES(11,'{\"token\":\"fixture\"}'),(12,'{}'),(13,'{\"token\":\"shared\"}'); INSERT INTO account_groups(account_id,group_id) VALUES(11,1),(12,1),(13,1),(13,2);")
+            .execute(&pool).await.unwrap();
+        let repository = super::Sub2Repository::new(pool.clone());
+        use crate::sub2_policy::AccountDispatch;
+        let updates = vec![
+            AccountDispatch {
+                member_order: 2,
+                id: 11,
+                priority: 1,
+                weight: 7,
+                concurrency: 4,
+                rpm: 0,
+                allowed_models: vec!["model-a".into()],
+            },
+            AccountDispatch {
+                member_order: 0,
+                id: 12,
+                priority: 1,
+                weight: 3,
+                concurrency: 2,
+                rpm: 0,
+                allowed_models: vec![],
+            },
+        ];
+        repository
+            .update_account_dispatch(1, &updates)
+            .await
+            .unwrap();
+        let saved = repository.dispatch_accounts(1).await.unwrap();
+        assert_eq!(saved[0].member_order, 2);
+        sqlx::query("ALTER TABLE accounts ADD COLUMN error_message TEXT, ADD COLUMN rate_limited_at TIMESTAMPTZ, ADD COLUMN temp_unschedulable_reason TEXT").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE accounts SET type='oauth' WHERE id=11")
+            .execute(&pool)
+            .await
+            .unwrap();
+        repository
+            .replace_managed_oauth_credentials(
+                1,
+                11,
+                "openai",
+                "renewed",
+                serde_json::json!({"token":"fixture"}),
+                serde_json::json!({"junohub_order":999}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.dispatch_accounts(1).await.unwrap()[0].member_order,
+            2
+        );
+        sqlx::query("UPDATE accounts SET type='apikey' WHERE id=11")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(saved[0].weight, 7);
+        assert_eq!(saved[1].priority, 1);
+        assert_eq!(saved[0].concurrency, 4);
+        assert_eq!(saved[0].allowed_models, vec!["model-a"]);
+        assert!(repository
+            .update_managed_account_config(
+                1,
+                11,
+                " FIXTURE ",
+                Some("https://example.com/v1"),
+                None,
+                "fixture-key"
+            )
+            .await
+            .is_err());
+        let mut detached = updates[0].clone();
+        detached.priority = 0;
+        repository
+            .update_account_dispatch(1, &[detached])
+            .await
+            .unwrap();
+        assert!(!repository
+            .schedulable_account_ids(1, "openai", false)
+            .await
+            .unwrap()
+            .contains(&11));
+        assert!(repository
+            .managed_accounts(1, "fixture-key")
+            .await
+            .unwrap()
+            .iter()
+            .any(|a| a.id == 11 && a.priority == 0));
+        repository
+            .update_account_dispatch(1, &updates)
+            .await
+            .unwrap();
+        let invalid = vec![
+            AccountDispatch {
+                member_order: 0,
+                id: 11,
+                priority: 2,
+                weight: 1,
+                concurrency: 1,
+                rpm: 0,
+                allowed_models: vec![],
+            },
+            AccountDispatch {
+                member_order: 0,
+                id: 999,
+                priority: 2,
+                weight: 1,
+                concurrency: 1,
+                rpm: 0,
+                allowed_models: vec![],
+            },
+        ];
+        assert!(repository
+            .update_account_dispatch(1, &invalid)
+            .await
+            .is_err());
+        assert_eq!(repository.dispatch_accounts(1).await.unwrap()[0].weight, 7);
+        sqlx::query(
+            "UPDATE accounts SET rate_limit_reset_at=NOW()+INTERVAL '60 seconds' WHERE id=12",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let summaries = repository
+            .managed_accounts(1, "fixture-encryption-key")
+            .await
+            .unwrap();
+        assert_eq!(
+            summaries.iter().find(|a| a.id == 12).unwrap().health,
+            "rate_limited"
+        );
+        assert_eq!(
+            summaries.iter().find(|a| a.id == 11).unwrap().concurrency,
+            4
+        );
+        assert!(repository.delete_managed_account(2, 11).await.is_err());
+        repository.delete_managed_account(1, 11).await.unwrap();
+        let removed: (bool,bool,bool) = sqlx::query_as("SELECT deleted_at IS NOT NULL,NOT schedulable,credentials='{}'::jsonb FROM accounts WHERE id=11").fetch_one(&pool).await.unwrap();
+        assert_eq!(removed, (true, true, true));
+        assert!(repository.delete_managed_account(1, 11).await.is_err());
+        repository.delete_managed_account(1, 13).await.unwrap();
+        let shared: (bool, bool) =
+            sqlx::query_as("SELECT deleted_at IS NULL,schedulable FROM accounts WHERE id=13")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(shared, (true, true));
+        let remaining: Vec<i64> =
+            sqlx::query_scalar("SELECT account_id FROM account_groups WHERE group_id=1")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, vec![12]);
+        repository.delete_managed_account(1, 12).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_groups WHERE group_id=1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduler_outbox WHERE event_type='account_changed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 3);
+    }
+
     use super::*;
 
     #[test]

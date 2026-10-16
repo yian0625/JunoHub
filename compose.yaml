@@ -1,5 +1,11 @@
 name: junohub
 
+# 所有持久化数据都放在 Docker 命名卷里，项目目录只保留代码和配置：
+#   junohub-data               业务库（SQLite）：用户、访问密钥、模型路由、日志、账单
+#   junohub-accounts-postgres  账户引擎账户池
+#   junohub-accounts-redis     账户引擎调度/粘性会话（可重建，非关键）
+# 备份与恢复请使用 ./deploy.sh backup / ./deploy.sh restore，不要手工复制数据目录。
+
 services:
   junohub-server:
     build:
@@ -25,6 +31,9 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    # 流式响应可能很长；给网关时间把在途请求跑完并释放账户并发槽，
+    # 否则 Docker 默认 10 秒后 SIGKILL，会掐断客户端并让槽位滞留到 TTL 到期。
+    stop_grace_period: 60s
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9003/health/readiness"]
       interval: 15s
@@ -47,6 +56,8 @@ services:
         condition: service_healthy
     ports:
       - "${JUNOHUB_WEB_PORT:-3003}:3003"
+      # 不占用官方客户端的固定 OAuth 回调端口（1455/8085/56121）。
+      # JunoHub 授权使用手动粘贴回调地址，避免干扰本机官方客户端登录。
     restart: unless-stopped
     healthcheck:
       test:
@@ -61,14 +72,20 @@ services:
 
   junohub-accounts-postgres:
     image: postgres:18-alpine
-    env_file:
-      - ./.env
+    # 只注入数据库自己需要的变量，不要整份 .env：里面还有 JUNOHUB_JWT_SECRET
+    # 和 JUNOHUB_ENCRYPTION_KEY（账号凭据的解密主密钥），数据库容器没有任何
+    # 理由拿到它们。缺变量时用 :? 直接报错退出，而不是带着空密码启动。
     environment:
       PGDATA: /var/lib/postgresql/data
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER 必须在 .env 中设置}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须在 .env 中设置}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB 必须在 .env 中设置}
     volumes:
-      - ./data/accounts/postgres:/var/lib/postgresql/data
+      - junohub-accounts-postgres:/var/lib/postgresql/data
       - ./deploy/accounts-schema.sql:/docker-entrypoint-initdb.d/01-accounts-schema.sql:ro
     restart: unless-stopped
+    # 让 PostgreSQL 有机会完成 fast shutdown，而不是被 SIGKILL 后走崩溃恢复。
+    stop_grace_period: 60s
     ulimits:
       nofile:
         soft: 100000
@@ -82,8 +99,9 @@ services:
 
   junohub-accounts-redis:
     image: redis:8-alpine
-    env_file:
-      - ./.env
+    # 同上：Redis 只需要自己的密码，不需要应用密钥。
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD 必须在 .env 中设置}
     command:
       - sh
       - -c
@@ -94,8 +112,9 @@ services:
           --appendfsync everysec \
           --requirepass "$$REDIS_PASSWORD"
     volumes:
-      - ./data/accounts/redis:/data
+      - junohub-accounts-redis:/data
     restart: unless-stopped
+    stop_grace_period: 30s
     ulimits:
       nofile:
         soft: 100000
@@ -110,3 +129,7 @@ services:
 volumes:
   junohub-data:
     name: junohub-data
+  junohub-accounts-postgres:
+    name: junohub-accounts-postgres
+  junohub-accounts-redis:
+    name: junohub-accounts-redis

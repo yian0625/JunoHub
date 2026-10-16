@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的旧运行自动取消，省得排队。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Rust 后端
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: junohub-server
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: junohub-server
+
+      - name: Clippy（警告视为错误）
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 测试
+        # 需要外部 Redis / PostgreSQL / OSS 的用例默认 #[ignore]，
+        # 这里不启动那些服务，跑的是全部自包含分支。
+        run: cargo test --all --no-fail-fast
+
+  frontend:
+    name: 前端
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: junohub-web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: junohub-web/package-lock.json
+
+      - run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: 测试
+        run: npm test
+
+  deployment:
+    name: 部署配置
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell 语法检查
+        run: bash -n deploy.sh
+
+      - name: ShellCheck
+        run: shellcheck --severity=warning deploy.sh
+
+      - name: Compose 配置校验
+        run: |
+          cp .env.docker.example .env
+          docker compose config -q
+          docker compose -f compose.yaml -f compose.monitoring.yaml --profile monitoring config -q
+          rm -f .env
+
+      - name: Dockerfile 校验
+        run: |
+          docker build --check -f junohub-server/Dockerfile junohub-server
+          docker build --check -f junohub-web/Dockerfile junohub-web

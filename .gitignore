@@ -1,11 +1,24 @@
+# 密钥文件：.env 以及任何 .env.<后缀> 变体（如 .env.before-restore.*）
+# 例外的只有示例文件，它们必须提交
 .env
+.env.*
+!.env.example
+!.env.docker.example
+
 *.db
 *.db-shm
 *.db-wal
 .DS_Store
+
 junohub-web/node_modules/
 junohub-web/.next/
 junohub-server/target/
 
-# Rust 账户引擎持久化数据
-data/
+# 备份产物（含 .env 副本，绝对不能提交）
+backups/
+
+# 旧布局迁移后保留的目录，确认无误后可删除
+data.migrated.*/
+
+# Dedicated monitoring credential; never commit.
+deploy/monitoring/secrets/
