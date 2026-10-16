@@ -23,6 +23,11 @@ pub struct Config {
     pub sub2api_session_hash_dual_write_old: bool,
     pub scheduler_worker_enabled: bool,
     pub account_engine_gateway_enabled: bool,
+    /// TokenHub 图片适配的适用范围：能触发该适配的上游主机名。
+    /// 留空表示不启用（默认）—— 不把任何第三方供应商地址内置进代码。
+    pub tokenhub_image_hosts: Vec<String>,
+    /// 同上：该适配能处理的上游模型名（不是别名）。
+    pub tokenhub_image_models: Vec<String>,
     /// 允许跨域访问本服务的浏览器来源（逗号分隔的 scheme://host[:port]）。
     /// 留空表示不放行任何跨域请求 —— 控制台经 Next.js 的 rewrite 同源代理
     /// 访问本服务，本来就不需要 CORS。
@@ -110,6 +115,13 @@ impl Config {
             allowed_origins: parse_origins(
                 &env::var("JUNOHUB_ALLOWED_ORIGINS").unwrap_or_default(),
             )?,
+            tokenhub_image_hosts: parse_hosts(
+                "JUNOHUB_TOKENHUB_IMAGE_HOSTS",
+                &env::var("JUNOHUB_TOKENHUB_IMAGE_HOSTS").unwrap_or_default(),
+            )?,
+            tokenhub_image_models: parse_list(
+                &env::var("JUNOHUB_TOKENHUB_IMAGE_MODELS").unwrap_or_default(),
+            ),
             log_retention_days: env::var("JUNOHUB_LOG_RETENTION_DAYS")
                 .unwrap_or_else(|_| "90".into())
                 .trim()
@@ -216,6 +228,40 @@ impl EmailConfig {
         }
         Ok(config)
     }
+}
+
+/// base_url 的主机名是否在给定列表内（大小写不敏感）。
+/// 主机列表来自配置，代码里不内置任何供应商地址。
+pub fn host_is_listed(hosts: &[String], base: &str) -> bool {
+    let Some(host) = url::Url::parse(base).ok().and_then(|url| url.host_str().map(str::to_ascii_lowercase)) else {
+        return false;
+    };
+    hosts.iter().any(|configured| configured.eq_ignore_ascii_case(&host))
+}
+
+/// 解析逗号分隔的列表：去空白、丢空项、去重，保持出现顺序。
+fn parse_list(raw: &str) -> Vec<String> {
+    let mut items: Vec<String> = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|entry| !entry.is_empty()) {
+        if !items.iter().any(|existing| existing == entry) {
+            items.push(entry.to_owned());
+        }
+    }
+    items
+}
+
+/// 解析主机名列表。只接受裸主机名：带上协议、端口或路径会导致永远匹配不上，
+/// 这种静默失效必须在启动时就说清楚。统一转小写，匹配时不再关心大小写。
+fn parse_hosts(name: &str, raw: &str) -> Result<Vec<String>> {
+    let mut hosts = Vec::new();
+    for entry in parse_list(raw) {
+        anyhow::ensure!(
+            !entry.contains(['/', ':', '@']) && !entry.chars().any(char::is_whitespace),
+            "{name} 只能填主机名，不要包含协议、端口或路径: {entry}"
+        );
+        hosts.push(entry.to_ascii_lowercase());
+    }
+    Ok(hosts)
 }
 
 /// 解析 JUNOHUB_ALLOWED_ORIGINS。
@@ -326,6 +372,27 @@ mod tests {
             assert!(email_config(&[("JUNOHUB_EMAIL_PROVIDER", "smtp"), (key, value)]).is_err());
         }
         assert_eq!(email_config(&[]).unwrap().provider, EmailProvider::Resend);
+    }
+
+    #[test]
+    fn tokenhub_scope_is_parsed_and_misconfigured_hosts_are_rejected() {
+        assert_eq!(parse_list(""), Vec::<String>::new());
+        assert_eq!(parse_list(" a , ,b, a "), vec!["a".to_string(), "b".to_string()]);
+        // 主机名统一小写，匹配时不区分大小写。
+        assert_eq!(
+            parse_hosts("T", " Images.EXAMPLE.test , cdn.example.test ").unwrap(),
+            vec!["images.example.test".to_string(), "cdn.example.test".to_string()]
+        );
+        // 带协议、端口、路径或内嵌凭据的一律拒绝，而不是留到运行期静默不匹配。
+        for invalid in [
+            "https://images.example.test",
+            "images.example.test:443",
+            "images.example.test/v1",
+            "user@images.example.test",
+            "images .example.test",
+        ] {
+            assert!(parse_hosts("T", invalid).is_err(), "{invalid} 应当被拒绝");
+        }
     }
 
     #[test]

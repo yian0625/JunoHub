@@ -892,7 +892,13 @@ async fn create_provider(state: &AppState, uid: i64, payload: Value) -> AppResul
     let limits = request_limits(&payload)?;
     let name = string(&payload, "name");
     let provider_type = string(&payload, "provider_type");
-    let base_url = validate_base_url(&string(&payload, "base_url"))?;
+    // 托管供应商的地址不参与路由，由账户引擎自己决定，不接受客户端提供的值：
+    // 客户端以前会传部署拓扑（容器名 + 端口），换个部署就写进了一条无效地址。
+    let base_url = if provider_type == "sub2api" {
+        crate::store::MANAGED_PROVIDER_BASE_URL.to_owned()
+    } else {
+        validate_base_url(&string(&payload, "base_url"))?
+    };
     let api_key = string(&payload, "api_key");
     let avatar_url = payload
         .get("avatar_url")
@@ -1185,7 +1191,7 @@ async fn test_provider(state: &AppState, uid: i64, payload: Value) -> AppResult<
     let config = crate::upstream_probe::test_config(&payload)?;
     let image_probe = keys
         .iter()
-        .any(|key| crate::upstream_probe::tokenhub_image_model(&key.base_url, model));
+        .any(|key| crate::upstream_probe::tokenhub_image_model(&state.config.tokenhub_image_hosts, &state.config.tokenhub_image_models, &key.base_url, model));
     let pending = stream::iter(keys.into_iter().map(|key| {
         let config = config.clone();
         let kind = kind.clone();
@@ -1414,9 +1420,10 @@ pub(crate) async fn provision_sub2api_provider(
     } else {
         format!("{base_name} {}", duplicate_count + 1)
     };
-    let provider = sqlx::query("INSERT INTO user_providers(user_id,name,provider_type,base_url,encrypted_api_key,enabled,created_at,updated_at) VALUES(?,?, 'sub2api','http://junohub-server:9003/v1',?,1,?,?)")
+    let provider = sqlx::query("INSERT INTO user_providers(user_id,name,provider_type,base_url,encrypted_api_key,enabled,created_at,updated_at) VALUES(?,?, 'sub2api',?,?,1,?,?)")
         .bind(uid)
         .bind(name)
+        .bind(crate::store::MANAGED_PROVIDER_BASE_URL)
         .bind(encrypted)
         .bind(timestamp)
         .bind(timestamp)
@@ -5193,6 +5200,62 @@ pub(crate) mod tests {
     use crate::config::Config;
 
     #[tokio::test]
+    async fn managed_provider_address_is_a_marker_not_deployment_topology() {
+        let state = state().await;
+        // 客户端以前会传部署拓扑地址（容器名 + 端口），现在无论传什么都不采用。
+        let created = create_provider(
+            &state,
+            1,
+            json!({
+                "name": "managed fixture",
+                "provider_type": "sub2api",
+                "base_url": "http://junohub-server:9003/v1",
+                "api_key": "private-managed-key",
+            }),
+        )
+        .await
+        .unwrap();
+        let stored: String = sqlx::query_scalar("SELECT base_url FROM user_providers WHERE id=?")
+            .bind(created["id"].as_i64().unwrap())
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, crate::store::MANAGED_PROVIDER_BASE_URL);
+        assert!(!stored.contains("junohub-server"));
+        // 标记值不是 http(s) 地址，不会被误当成真实上游端点。
+        assert!(validate_base_url(&stored).is_err());
+
+        // 非托管供应商仍然要求并保存客户端提供的真实地址。
+        let direct = create_provider(
+            &state,
+            1,
+            json!({"name":"direct fixture","provider_type":"openai","base_url":"https://supplier.test/v1"}),
+        )
+        .await
+        .unwrap();
+        let direct_base: String = sqlx::query_scalar("SELECT base_url FROM user_providers WHERE id=?")
+            .bind(direct["id"].as_i64().unwrap())
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(direct_base, "https://supplier.test/v1");
+
+        // 真正挂进账户池的托管供应商，其地址不允许被改回一个真实地址。
+        sqlx::query("INSERT INTO sub2_managed_pools(provider_id,user_id,platform,group_id,api_key_id,created_at,updated_at) VALUES(?,1,'openai',1,1,0,0)")
+            .bind(created["id"].as_i64().unwrap())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let rejected = update_provider(
+            &state,
+            1,
+            json!({"id": created["id"], "base_url": "https://elsewhere.test/v1"}),
+        )
+        .await;
+        assert!(matches!(rejected, Err(crate::error::AppError::BadRequest(_))));
+    }
+
+    #[tokio::test]
     #[ignore = "requires isolated JUNOHUB_TEST_REDIS_URL"]
     async fn tokenhub_images_gateway_alias_auth_usage() {
         use axum::{
@@ -5204,6 +5267,11 @@ pub(crate) mod tests {
         let mut state = state().await;
         let redis = redis::Client::open(std::env::var("JUNOHUB_TEST_REDIS_URL").unwrap()).unwrap();
         state.sub2_redis = Some(redis.get_connection_manager().await.unwrap());
+        // 图片适配的作用范围来自配置，代码里没有内置的供应商地址。
+        Arc::make_mut(&mut state.config).tokenhub_image_hosts =
+            vec!["images.example.test".into()];
+        Arc::make_mut(&mut state.config).tokenhub_image_models =
+            vec!["gpt-image-2".into(), "gpt-image-2.5-sunburst".into(), "gpt-image-2.5-flare".into()];
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app=Router::new().route("/v2/extend/image/async/gpt_image/generations",post(|headers:HeaderMap,Json(body):Json<Value>|async move {
@@ -5220,10 +5288,10 @@ pub(crate) mod tests {
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         state.client = Client::builder()
             .no_proxy()
-            .resolve("tokenhub.piegateway.me", addr)
+            .resolve("images.example.test", addr)
             .build()
             .unwrap();
-        let provider=create_provider(&state,1,json!({"name":"TokenHub fixture","provider_type":"openai","base_url":format!("http://tokenhub.piegateway.me:{}/v1",addr.port()),"api_key":"private-tokenhub-key"})).await.unwrap()["id"].as_i64().unwrap();
+        let provider=create_provider(&state,1,json!({"name":"TokenHub fixture","provider_type":"openai","base_url":format!("http://images.example.test:{}/v1",addr.port()),"api_key":"private-tokenhub-key"})).await.unwrap()["id"].as_i64().unwrap();
         create_model(&state,1,json!({"provider_id":provider,"alias":"my-image","upstream_model":"gpt-image-2.5-flare"})).await.unwrap();
         let key = create_key(
             &state,
@@ -6100,6 +6168,8 @@ pub(crate) mod tests {
                 scheduler_worker_enabled: false,
                 account_engine_gateway_enabled: false,
                 allowed_origins: Vec::new(),
+                tokenhub_image_hosts: Vec::new(),
+                tokenhub_image_models: Vec::new(),
                 log_retention_days: 0,
             }),
             client: Client::builder()
