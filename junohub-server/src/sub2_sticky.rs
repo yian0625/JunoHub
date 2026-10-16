@@ -172,7 +172,7 @@ impl StickyStore {
             if let Some(legacy_hash) = legacy_hash.filter(|value| !value.trim().is_empty()) {
                 let legacy_key = session_key(group_id, &format!("openai:{}", legacy_hash.trim()))?;
                 if legacy_key != current_key {
-                    let legacy_ttl = self.sticky_ttl_seconds.min(600).max(1);
+                    let legacy_ttl = self.sticky_ttl_seconds.clamp(1, 600);
                     let _: () = connection
                         .set_ex(legacy_key, account_id, legacy_ttl as u64)
                         .await
@@ -200,7 +200,7 @@ impl StickyStore {
                 let legacy_key = session_key(group_id, &format!("openai:{}", legacy_hash.trim()))?;
                 if legacy_key != current_key {
                     let _: bool = connection
-                        .expire(legacy_key, self.sticky_ttl_seconds.min(600).max(1))
+                        .expire(legacy_key, self.sticky_ttl_seconds.clamp(1, 600))
                         .await
                         .map_err(redis_error)?;
                 }

@@ -1589,8 +1589,6 @@ impl SchedulerCache {
             ranked.push((account, load));
         }
 
-        let min_priority = ranked.iter().map(|(a, _)| a.priority).min().unwrap_or(0);
-        let max_priority = ranked.iter().map(|(a, _)| a.priority).max().unwrap_or(0);
         let max_waiting = ranked
             .iter()
             .map(|(_, load)| load.waiting_count)
@@ -1600,18 +1598,11 @@ impl SchedulerCache {
         let mut ranked: Vec<RankedCandidate> = ranked
             .into_iter()
             .map(|(account, load)| {
-                let priority_factor = if max_priority > min_priority {
-                    1.0 - f64::from(account.priority - min_priority)
-                        / f64::from(max_priority - min_priority)
-                } else {
-                    1.0
-                };
                 let load_factor = 1.0 - (load.load_rate as f64 / 100.0).clamp(0.0, 1.0);
                 let queue_factor =
                     1.0 - (load.waiting_count as f64 / max_waiting as f64).clamp(0.0, 1.0);
-                // Go defaults: priority=1, load=1, queue=.7, error=.8, TTFT=.5.
-                // Runtime error/TTFT samples are process-local, so neutral values are used here.
-                let score = priority_factor + load_factor + 0.7 * queue_factor + 0.8 + 0.25;
+                // Priority is a strict tier. Load and queue only rank accounts inside one tier.
+                let score = load_factor + 0.7 * queue_factor + 0.8 + 0.25;
                 RankedCandidate {
                     account_id: account.id,
                     priority: account.priority,
@@ -1620,16 +1611,7 @@ impl SchedulerCache {
                 }
             })
             .collect();
-        ranked.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left.priority.cmp(&right.priority))
-                .then_with(|| left.load.load_rate.cmp(&right.load.load_rate))
-                .then_with(|| left.load.waiting_count.cmp(&right.load.waiting_count))
-                .then_with(|| left.account_id.cmp(&right.account_id))
-        });
+        sort_ranked_candidates(&mut ranked);
 
         let selected_layer = if promote_candidate(&mut ranked, request.previous_response_account_id)
         {
@@ -1637,7 +1619,7 @@ impl SchedulerCache {
         } else if promote_candidate(&mut ranked, request.sticky_account_id) {
             "session_hash"
         } else {
-            "load_balance"
+            "priority_order"
         };
         let selected_account_id = ranked.first().map(|candidate| candidate.account_id);
 
@@ -1717,14 +1699,32 @@ impl SchedulerCache {
     }
 }
 
+fn sort_ranked_candidates(candidates: &mut [RankedCandidate]) {
+    candidates.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| left.load.load_rate.cmp(&right.load.load_rate))
+            .then_with(|| left.load.waiting_count.cmp(&right.load.waiting_count))
+            .then_with(|| left.account_id.cmp(&right.account_id))
+    });
+}
+
 fn promote_candidate(candidates: &mut Vec<RankedCandidate>, account_id: Option<i64>) -> bool {
     let Some(account_id) = account_id.filter(|id| *id > 0) else {
         return false;
     };
-    let Some(index) = candidates
-        .iter()
-        .position(|candidate| candidate.account_id == account_id)
-    else {
+    let Some(first_priority) = candidates.first().map(|candidate| candidate.priority) else {
+        return false;
+    };
+    let Some(index) = candidates.iter().position(|candidate| {
+        candidate.account_id == account_id && candidate.priority == first_priority
+    }) else {
         return false;
     };
     if index > 0 {
@@ -1838,7 +1838,7 @@ mod tests {
     }
 
     #[test]
-    fn sticky_candidate_promotion_only_uses_eligible_accounts() {
+    fn priority_order_is_strict_and_sticky_stays_inside_the_first_tier() {
         let load = || AccountLoad {
             current_concurrency: 0,
             waiting_count: 0,
@@ -1848,20 +1848,32 @@ mod tests {
             RankedCandidate {
                 account_id: 1,
                 priority: 1,
-                score: 3.0,
+                score: 1.0,
                 load: load(),
             },
             RankedCandidate {
                 account_id: 2,
                 priority: 2,
+                score: 9.0,
+                load: load(),
+            },
+            RankedCandidate {
+                account_id: 3,
+                priority: 1,
                 score: 2.0,
                 load: load(),
             },
         ];
-        assert!(promote_candidate(&mut candidates, Some(2)));
-        assert_eq!(candidates[0].account_id, 2);
+        sort_ranked_candidates(&mut candidates);
+        assert_eq!(candidates[0].account_id, 3);
+        assert_eq!(candidates[1].account_id, 1);
+        assert_eq!(candidates[2].account_id, 2);
+        assert!(!promote_candidate(&mut candidates, Some(2)));
+        assert_eq!(candidates[0].account_id, 3);
+        assert!(promote_candidate(&mut candidates, Some(1)));
+        assert_eq!(candidates[0].account_id, 1);
         assert!(!promote_candidate(&mut candidates, Some(99)));
-        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates.len(), 3);
     }
 
     #[test]

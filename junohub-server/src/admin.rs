@@ -16,6 +16,8 @@ pub async fn dispatch(
     Json(payload): Json<Value>,
 ) -> AppResult<Json<Envelope<Value>>> {
     let data = match path.trim_matches('/') {
+        "guide/update" => crate::access_guide::save(&state, &payload).await?,
+        "users/detail" => crate::console::admin_user_detail(&state, &payload).await?,
         "users/list" => crate::console::admin_users(&state, &payload).await?,
         "users/update" => crate::console::admin_update_user(&state, &payload).await?,
         "rust-engine/gateway/openai-probe" => {

@@ -1,13 +1,19 @@
 "use client"
 
+import { cn } from "@/lib/utils"
 import { ReactNode } from "react"
 import { Button } from "@/components/ui/button"
+import { Card } from "@/components/ui/card"
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty"
+import { Spinner } from "@/components/ui/spinner"
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { ChevronLeft, ChevronRight } from "lucide-react"
 
 export interface Column<T = object> {
   key: string
   title: string
   render?: (value: unknown, row: T, index: number) => ReactNode
+  align?: "start" | "end"
   className?: string
 }
 
@@ -20,6 +26,13 @@ interface DataTableProps<T = object> {
   onPageChange: (page: number) => void
   loading?: boolean
   rowKey?: string
+  compact?: boolean
+  hideSinglePage?: boolean
+  tableClassName?: string
+  emptyTitle?: string
+  emptyDescription?: string
+  emptyIcon?: ReactNode
+  embedded?: boolean
 }
 
 function cellValue<T extends object>(row: T, key: string): unknown {
@@ -35,75 +48,84 @@ export function DataTable<T extends object = Record<string, unknown>>({
   onPageChange,
   loading = false,
   rowKey = "id",
+  compact = false,
+  hideSinglePage = false,
+  tableClassName,
+  emptyTitle = "暂无数据",
+  emptyDescription,
+  emptyIcon,
+  embedded = false,
 }: DataTableProps<T>) {
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
   return (
-    <div className="space-y-4">
-      <div className="overflow-hidden rounded-2xl border border-[var(--glass-border)] bg-[var(--glass-bg)] shadow-[var(--glass-highlight),var(--shadow-surface)] backdrop-blur-2xl backdrop-saturate-150">
-        <div className="overflow-x-auto overscroll-x-contain">
-          <table className="min-w-[760px] w-full text-sm">
-            <thead>
-              <tr className="border-b border-border-subtle bg-bg-sunken">
+    <Card className={cn("gap-0 py-0", embedded && "border-0 bg-transparent shadow-none")}>
+          <Table className={cn("min-w-[760px] text-sm", tableClassName)} containerProps={{ role: "region", "aria-label": "数据表格，可横向滚动", tabIndex: 0, className: "overscroll-x-contain focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring" }}>
+            <TableHeader>
+              <TableRow className="bg-bg-sunken/60 hover:bg-bg-sunken/60">
                 {columns.map((col) => (
-                  <th
+                  <TableHead
                     key={col.key}
-                    className={`whitespace-nowrap px-5 py-3.5 text-left text-xs font-semibold text-muted-foreground ${col.className || ""}`}
+                    scope="col"
+                    className={cn("whitespace-nowrap text-xs font-semibold text-muted-foreground", compact ? "px-4 py-2.5" : "px-5 py-3.5", col.align === "end" ? "text-end" : "text-start", col.className)}
                   >
                     {col.title}
-                  </th>
+                  </TableHead>
                 ))}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-border-subtle">
+              </TableRow>
+            </TableHeader>
+            <TableBody>
               {loading ? (
-                <tr>
-                  <td
+                <TableRow>
+                  <TableCell
                     colSpan={columns.length}
                     className="h-32 text-center text-sm text-muted-foreground"
                   >
                     <div className="flex items-center justify-center gap-2" role="status">
-                      <div className="size-4 animate-spin rounded-full border-2 border-muted-foreground/20 border-t-muted-foreground/60" aria-hidden="true" />
+                      <Spinner className="size-4" />
                       正在加载
                     </div>
-                  </td>
-                </tr>
+                  </TableCell>
+                </TableRow>
               ) : data.length === 0 ? (
-                <tr>
-                  <td
+                <TableRow>
+                  <TableCell
                     colSpan={columns.length}
                     className="h-32 text-center text-sm text-muted-foreground"
                   >
-                    暂无数据
-                  </td>
-                </tr>
+                    <Empty className="border-0 py-6">
+                      {emptyIcon && <EmptyMedia variant="icon">{emptyIcon}</EmptyMedia>}
+                      <EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle>{emptyDescription && <EmptyDescription>{emptyDescription}</EmptyDescription>}</EmptyHeader>
+                    </Empty>
+                  </TableCell>
+                </TableRow>
               ) : (
                 data.map((row, idx) => (
-                  <tr
+                  <TableRow
                     key={String(cellValue(row, rowKey) ?? idx)}
-                    className="transition-colors duration-150 hover:bg-bg-raised"
+                    className="transition-colors duration-150 hover:bg-bg-sunken"
                   >
                     {columns.map((col) => (
-                      <td
+                      <TableCell
                         key={col.key}
-                        className={`whitespace-nowrap px-5 py-4 align-middle text-sm text-text-primary ${col.className || ""}`}
+                        className={cn("whitespace-nowrap align-middle text-sm text-text-primary", compact ? "px-4 py-2.5" : "px-5 py-4", col.align === "end" && "text-end tabular-nums", col.className)}
                       >
                         {col.render
                           ? col.render(cellValue(row, col.key), row, idx)
                           : (cellValue(row, col.key) as ReactNode)}
-                      </td>
+                      </TableCell>
                     ))}
-                  </tr>
+                  </TableRow>
                 ))
               )}
-            </tbody>
-          </table>
-        </div>
-      </div>
+            </TableBody>
+          </Table>
+
+      <p className="border-t border-border-default px-5 py-2 text-xs text-muted-foreground sm:hidden">左右滑动查看完整表格</p>
 
       {/* Pagination */}
-      {total > 0 && (
-        <div className="flex flex-col gap-3 px-1 sm:flex-row sm:items-center sm:justify-between">
+      {total > 0 && (!hideSinglePage || totalPages > 1) && (
+        <div className="resource-card-footer flex flex-col gap-3 border-t border-border-default px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
           <p className="text-xs font-medium text-muted-foreground">
             共 {total} 条，第 {page} / {totalPages} 页
           </p>
@@ -131,6 +153,6 @@ export function DataTable<T extends object = Record<string, unknown>>({
           </div>
         </div>
       )}
-    </div>
+    </Card>
   )
 }

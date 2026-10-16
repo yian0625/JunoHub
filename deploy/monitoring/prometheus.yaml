@@ -1,0 +1,29 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+rule_files:
+  - /etc/prometheus/rules.yaml
+scrape_configs:
+  - job_name: junohub
+    metrics_path: /metrics
+    scrape_timeout: 5s
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/metrics-token
+    static_configs:
+      - targets: [junohub-server:9003]
+  - job_name: junohub_http
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - http://junohub-server:9003/health/readiness
+          - http://junohub-web:3003/login
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: junohub-blackbox:9115

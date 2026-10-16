@@ -128,11 +128,12 @@ pub fn spawn(state: AppState) -> Option<JoinHandle<()>> {
         return None;
     }
     Some(tokio::spawn(async move {
-        let worker = SchedulerWorker::new(state);
+        let worker = SchedulerWorker::new(state.clone());
         loop {
-            if let Err(error) = worker.poll().await {
-                error!(error = %error, "Rust scheduler outbox poll failed");
-            }
+            crate::monitor::heartbeat(&state,"account_scheduler",true,None).await;
+            let result=worker.poll().await;
+            crate::monitor::heartbeat(&state,"account_scheduler",true,Some(result.is_ok())).await;
+            if let Err(error)=result {error!(error = %error, "Rust scheduler outbox poll failed");}
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }))

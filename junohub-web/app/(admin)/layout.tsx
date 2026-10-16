@@ -1,19 +1,32 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
+import { usePathname, useRouter } from "next/navigation"
+import { Button } from "@/components/ui/button"
 import { useAuth } from "@/hooks/use-auth"
-import { AppTopbar, Sidebar } from "@/components/sidebar"
-import { cn } from "@/lib/utils"
+import { AppSidebar, AppTopbar } from "@/components/sidebar"
+import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
+import type { CSSProperties } from "react"
 
 export default function AdminLayout({
   children,
 }: {
   children: React.ReactNode
 }) {
-  const { isReady, token } = useAuth()
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const { isReady, token, user, error, retry } = useAuth()
+  const pathname = usePathname()
+  const router = useRouter()
+  const restricted = user?.role !== "admin" && ["/console/monitor", "/console/providers", "/console/models", "/console/keys", "/juno-hub"].some(path => pathname === path || pathname.startsWith(`${path}/`))
+  useEffect(() => {
+    if (isReady && token && restricted) router.replace(pathname.startsWith("/console/models") ? "/console/available-models" : pathname.startsWith("/console/keys") ? "/console/my-keys" : "/console")
+  }, [isReady, token, restricted, pathname, router])
+  const [sidebarOpen, setSidebarOpen] = useState(() =>
+    typeof document === "undefined" ||
+    document.cookie.split("; ").find(part => part.startsWith("sidebar_state="))?.split("=")[1] !== "false"
+  )
 
-  if (!isReady || !token) {
+  if (error) return <div role="alert" className="flex min-h-screen flex-col items-center justify-center gap-4 px-6"><p className="text-sm">{error}</p><Button variant="outline" onClick={retry}>重新加载</Button></div>
+  if (!isReady || !token || restricted) {
     return (
       <div className="flex min-h-screen items-center justify-center" role="status" aria-label="正在加载控制台">
         <div className="flex items-center gap-3 text-muted-foreground">
@@ -25,12 +38,12 @@ export default function AdminLayout({
   }
 
   return (
-    <div className="admin-shell min-h-screen pt-4">
-      <AppTopbar sidebarCollapsed={sidebarCollapsed} onSidebarToggle={() => setSidebarCollapsed(value => !value)} />
-      <Sidebar collapsed={sidebarCollapsed} />
-      <div className={cn("admin-content transition-[padding] duration-200", sidebarCollapsed ? "lg:ps-28" : "lg:ps-72")}>
-        <main id="main-content" tabIndex={-1} className="admin-main max-w-[1440px] px-4 py-8 focus:outline-none sm:px-6 lg:pe-10 lg:ps-6 lg:py-10">{children}</main>
-      </div>
-    </div>
+    <SidebarProvider open={sidebarOpen} onOpenChange={setSidebarOpen} className="admin-shell min-h-screen" style={{ "--sidebar-width": "15rem", "--sidebar-width-icon": "5rem" } as CSSProperties}>
+      <AppSidebar />
+      <SidebarInset id="main-content" tabIndex={-1} className="admin-content min-w-0 bg-bg-page focus:outline-none">
+        <AppTopbar />
+        <div className="admin-main mx-auto w-full max-w-[1440px] px-4 py-8 sm:px-6 lg:px-8 lg:py-10">{children}</div>
+      </SidebarInset>
+    </SidebarProvider>
   )
 }

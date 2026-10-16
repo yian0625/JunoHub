@@ -18,8 +18,9 @@ JunoHub product surface exercises.
 
 The JunoHub product surface—not the upstream admin UI—is the compatibility contract:
 
-- Account creation via JunoHub console: OpenAI Codex OAuth + API-key accounts for
-  `openai / anthropic / gemini / grok / antigravity / kimi / zhipu / deepseek`.
+- Account creation via JunoHub console: browser PKCE OAuth for OpenAI Codex, Claude,
+  Gemini, Grok and Antigravity; access/refresh-token import for non-OpenAI OAuth accounts;
+  and API-key accounts for `openai / anthropic / gemini / grok / kimi / zhipu / deepseek`.
 - Gateway protocols: OpenAI Chat Completions + Responses (Codex OAuth passthrough and
   conversion), generic OpenAI-compatible forwarding for API-key accounts, and
   Chat Completions ⇄ Anthropic Messages / Gemini generateContent conversion (request,
@@ -33,8 +34,8 @@ The JunoHub product surface—not the upstream admin UI—is the compatibility c
 - Codex SSE aggregation: `response.completed` carries an empty `output` array on the ChatGPT
   backend; terminal responses are assembled from `response.output_item.done` events.
 
-Out of scope (upstream-only surface, no JunoHub product path): the Go admin web UI, Gemini /
-Claude / Grok / Antigravity OAuth wizards, WebSocket ingress, image generation endpoints,
+Out of scope (upstream-only surface, no JunoHub product path): the Go admin web UI, automated
+password/cookie login, WebSocket ingress, image generation endpoints,
 channel monitors, billing/pricing tables, announcements and audit logs. The PostgreSQL schema
 retains those tables (see `deploy/accounts-schema.sql`) so the data is never lost, but no Rust
 code writes them.
@@ -51,8 +52,8 @@ code writes them.
 8. Antigravity and China-provider account flows
 9. Model discovery and mapping
 10. Scheduler, sticky sessions, concurrency and cooldowns
-11. Gateway protocols, streaming, WebSocket and images
-12. Usage, quota, billing and background jobs
+11. Gateway protocols and streaming used by JunoHub
+12. BYOK usage accounting and background jobs
 13. Shadow traffic and Go/Rust differential verification
 14. Cutover and removal of the Go container
 
@@ -65,7 +66,8 @@ A module is not complete until it preserves:
 - Token refresh and credential encryption behavior
 - Streaming event order
 - Scheduler selection and exclusion behavior
-- Usage and billing side effects
+- Usage side effects for JunoHub BYOK requests (token counts are persisted in SQLite and
+  PostgreSQL; monetary cost remains zero because JunoHub does not define a resale price)
 - Existing PostgreSQL data
 
 ## Completion audit
@@ -88,12 +90,23 @@ through the Rust engine with the same account pool and prompt:
 - Go: `{"content":"GO-BASELINE-OK","model":"gpt-5.6","usage":{"prompt_tokens":16,"completion_tokens":10,"total_tokens":26},"id":"resp_…"}`
 - Rust: identical content, model echo, usage and `resp_…` id shape (HTTP 200).
 
-Also verified post-cutover: SSE chat streaming chunk order, `/v1/models` parity via the
-repository (13 models), scheduler outbox watermark advancing over injected `full_rebuild`
-events, sticky_session / response-owner Redis keys, `accounts.last_used_at` updates and
-`account_last_used` outbox rows.
+Also verified post-cutover: SSE chat streaming chunk order, live upstream model discovery,
+scheduler outbox watermark advancement, sticky-session / response-owner Redis keys,
+`accounts.last_used_at` updates, `account_last_used` outbox rows and BYOK token usage writes.
 
 ## Current progress
+
+### 2026-09-10 compatibility audit corrections
+
+Historical checked milestones below are not a full compatibility certification. The focused audit is recorded in `docs/sub2api-compatibility-audit-2026-09-10.md`.
+
+- [x] Durable OAuth completion receipts: encrypted token continuation after provisioning failure, identity/state/target binding, concurrent claim exclusion and completed-result replay
+- [x] Callback state validation and duplicate-submit guards; Gemini registration/onboarding branching and explicit unsupported-client rejection
+- [ ] OAuth per-account generation tests and platform-correct model discovery connected to the console
+- [ ] Account model mappings applied during forwarding and verified against Go
+- [ ] Pre-refresh concurrency coordination and rotation-race regression tests
+- [ ] Real OAuth browser-to-account regression after the authorization fixes (Google eligibility is not implied by local tests)
+- [ ] Gemini/Antigravity tool-result names, thought/signature handling, thinking-token accounting, project backfill and reauthorization configuration preservation verified against the upstream behavior
 
 - [x] Runtime service and data moved into the JunoHub Compose stack
 - [x] Fixed source and license baseline
@@ -115,7 +128,7 @@ events, sticky_session / response-owner Redis keys, `accounts.last_used_at` upda
 - [x] Read-only scheduler eligibility and concurrency-load snapshots
 - [x] Deterministic candidate ranking using Go default score weights
 - [x] Atomic concurrency slot acquire/release semantics (config-aligned 30 minute TTL)
-- [x] Live lease heartbeat and WebSocket ingress semantics
+- [x] Live lease heartbeat for long-running SSE streams
 - [x] User concurrency slots and API-key request tracking
 - [x] Account/user wait queues and active-index maintenance
 - [x] OpenAI xxHash/SHA-256 sticky-session key compatibility
@@ -131,7 +144,7 @@ events, sticky_session / response-owner Redis keys, `accounts.last_used_at` upda
 - [x] Scheduler outbox cleanup advisory-lock and age-window rollback probe
 - [x] Rust scheduler worker enabled as the only scheduler runtime
 - [x] Full canonical snapshot rebuild on isolated Redis database
-- [x] PostgreSQL-native model discovery with Go parity
+- [x] Live provider model discovery with account failover and protocol-specific headers
 - [x] OpenAI Codex OAuth Responses streaming and non-stream aggregation
 - [x] OpenAI Chat Completions request/response/SSE bridge
 - [x] OpenAI OAuth pre-refresh with PostgreSQL refresh-token CAS
@@ -143,19 +156,37 @@ events, sticky_session / response-owner Redis keys, `accounts.last_used_at` upda
   - [x] OAuth account, group and Key persistence transaction
   - [x] JunoHub provider and model-route provisioning
   - [x] Authorization-code acceptance exercised by the production account
-  - [x] Gemini, Claude, Grok and Antigravity OAuth scoped out (upstream-only surface; product offers API-key accounts for those platforms)
+  - [x] Claude browser PKCE OAuth, token exchange/import and refresh
+  - [x] Gemini Code Assist, Google One and custom AI Studio OAuth clients
+  - [x] Grok browser PKCE OAuth, token exchange/import and refresh
+  - [x] Antigravity browser PKCE OAuth, token exchange/import and refresh
+  - [x] OAuth callback pages for fixed localhost ports 1455, 8085 and 56121
+  - [x] OAuth session encryption, persistence across restarts and atomic single-use consume
+  - [x] OAuth/API credentials encrypted field-by-field in PostgreSQL, including legacy migration
+- [x] Managed account pools
+  - [x] Additional accounts of the same user/platform join one group and provider
+  - [x] Provider deletion cascades through model routes, internal Key, group and accounts
 - [x] Scheduler
   - [x] Gateway selection prefers previous_response_id and session-hash affinity
   - [x] Snapshot-ranked candidates with DB fallback when buckets are cold
   - [x] last_used DB/Redis writes plus account_last_used outbox events
+  - [x] Retryable transport/status failures exclude the failed account and select another
+  - [x] Rate-limit, overload and temporary cooldown state is persisted and cleared on recovery
 - [x] Gateway protocol cutover
   - [x] Codex family-alias fallback (`gpt-5.x` → `gpt-5.x-sol`) with requested-model echo
   - [x] Codex SSE aggregation from `response.output_item.done` items
   - [x] Codex conversion drops `temperature` / `max_output_tokens` (upstream rejects them)
   - [x] Chat Completions ⇄ Anthropic Messages conversion (request/response/SSE/errors)
   - [x] Chat Completions ⇄ Gemini generateContent conversion (request/response/SSE/errors)
+  - [x] Claude OAuth Bearer and required beta headers
+  - [x] Gemini/Antigravity `v1internal` project request wrapping and response unwrapping
+  - [x] Grok CLI gateway identity headers and Responses/Chat Completions forwarding
   - [x] Engine builds its own upstream headers (no client header leakage)
   - [x] sub2api providers never fall back to the removed Go base URL
   - [x] Existing provider rows migrated to `http://junohub-server:9003/v1` at startup
+- [x] Usage accounting
+  - [x] JSON and SSE usage extraction with tokenizer fallback when upstream omits input usage
+  - [x] Per-request and per-Key token totals in the JunoHub console
+  - [x] Matching token rows in the account-engine `usage_logs` table
 - [x] Go container and `sub2api/` directory removed; data relocated to `data/accounts/`
 - [x] Fresh-install schema bootstrap via `deploy/accounts-schema.sql`

@@ -1,0 +1,77 @@
+groups:
+  - name: junohub_availability
+    rules:
+      - alert: JunoHubMetricsUnavailable
+        expr: up{job="junohub"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: JunoHub 后端不可采集
+          description: 后端不可访问或监控凭据失效；检查服务、网络和采集凭据。
+      - alert: JunoHubHTTPUnavailable
+        expr: probe_success{job="junohub_http"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: JunoHub HTTP 健康检查失败
+          description: '{{ $labels.instance }} 持续无法返回 HTTP 200。'
+      - alert: JunoHubProbeUnavailable
+        expr: up{job="junohub_http"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: HTTP 探测服务不可采集
+      - alert: JunoHubMonitorStale
+        expr: (time() - junohub_monitor_last_success_timestamp_seconds > 90) or ((up{job="junohub"} == 1) unless on(job,instance) junohub_monitor_last_success_timestamp_seconds)
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: 站内监控采集停止更新
+      - alert: JunoHubDependencyUnavailable
+        expr: (junohub_dependency_up == 0) and on(job,instance) (time() - junohub_monitor_last_success_timestamp_seconds <= 90)
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: '{{ $labels.dependency }} 连接异常'
+      - alert: JunoHubWorkerUnavailable
+        expr: (junohub_worker_up == 0) and on(job,instance) (time() - junohub_monitor_last_success_timestamp_seconds <= 90)
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: '{{ $labels.worker }} 后台任务异常'
+      - alert: JunoHubRecordWriteFailure
+        expr: increase(junohub_log_write_failures_total[5m]) > 0
+        for: 30s
+        labels: {severity: critical}
+        annotations:
+          summary: 请求日志或配置审计写入失败
+      - alert: JunoHubServerErrorRate
+        expr: (sum(rate(junohub_http_completed_total{outcome="5xx",route!="control",route!="other",route!="authentication"}[5m])) / sum(rate(junohub_http_completed_total{outcome=~"2xx|3xx|4xx|5xx",route!="control",route!="other",route!="authentication"}[5m])) > 0.2) and (sum(increase(junohub_http_completed_total{outcome=~"2xx|3xx|4xx|5xx",route!="control",route!="other",route!="authentication"}[5m])) >= 20)
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: 中转接口服务错误率超过 20%
+      - alert: JunoHubTaskSettlementBacklog
+        expr: (junohub_tasks{state="unsettled"} >= 10) and on(job,instance) (time() - junohub_monitor_last_success_timestamp_seconds <= 90)
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: 异步任务结算积压
+      - alert: JunoHubSecurityRejectionSpike
+        expr: sum by(reason) (increase(junohub_security_rejections_total{reason=~"unowned_resource|unmanaged_resource|auth_rate_limit|invalid_endpoint"}[5m])) >= 20
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: '安全拒绝请求增加：{{ $labels.reason }}'
+      - alert: JunoHubAuthorizationConfigurationInvalid
+        expr: sum(increase(junohub_security_rejections_total{reason="invalid_account_permissions"}[5m])) > 0
+        for: 30s
+        labels: {severity: critical}
+        annotations:
+          summary: 上游账户模型权限配置损坏
+      - alert: JunoHubAuthenticationProtectionUnavailable
+        expr: sum(increase(junohub_security_rejections_total{reason="auth_dependency"}[5m])) > 0
+        for: 30s
+        labels: {severity: critical}
+        annotations:
+          summary: 登录限流依赖异常，登录与注册已暂停

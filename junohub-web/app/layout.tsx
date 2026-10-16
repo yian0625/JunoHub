@@ -26,7 +26,7 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="zh-CN" className={`h-full antialiased ${geist.variable} ${geistMono.variable}`} suppressHydrationWarning>
+    <html lang="zh-CN" className={`style-nova h-full antialiased ${geist.variable} ${geistMono.variable}`} suppressHydrationWarning>
       <body className="min-h-full">
         <a href="#main-content" className="skip-link">跳到主要内容</a>
         <Providers>{children}</Providers>

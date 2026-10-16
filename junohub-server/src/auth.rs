@@ -27,13 +27,21 @@ struct Claims {
     uid: i64,
     role: String,
     exp: usize,
+    #[serde(default)]
+    session_version: i64,
 }
 
-pub fn issue_user_token(
+#[cfg(test)]
+pub fn issue_user_token(state: &AppState, uid:i64, subject:String, role:String) -> AppResult<String> {
+    issue_user_token_at_version(state,uid,subject,role,0)
+}
+
+pub fn issue_user_token_at_version(
     state: &AppState,
     uid: i64,
     subject: String,
     role: String,
+    session_version: i64,
 ) -> AppResult<String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -46,13 +54,14 @@ pub fn issue_user_token(
             uid,
             role,
             exp: (now + 7 * 24 * 3600) as usize,
+            session_version,
         },
         &EncodingKey::from_secret(state.config.jwt_secret.as_bytes()),
     )
     .map_err(|e| AppError::Internal(e.to_string()))
 }
 
-fn decode_user(state: &AppState, token: &str) -> AppResult<CurrentUser> {
+fn decode_user(state: &AppState, token: &str) -> AppResult<(CurrentUser,i64)> {
     let claims = decode::<Claims>(
         token,
         &DecodingKey::from_secret(state.config.jwt_secret.as_bytes()),
@@ -60,11 +69,11 @@ fn decode_user(state: &AppState, token: &str) -> AppResult<CurrentUser> {
     )
     .map_err(|_| AppError::Unauthorized)?
     .claims;
-    Ok(CurrentUser {
+    Ok((CurrentUser {
         sub: claims.sub,
         uid: claims.uid,
         role: claims.role,
-    })
+    },claims.session_version))
 }
 
 pub async fn require_account(
@@ -73,14 +82,15 @@ pub async fn require_account(
     next: Next,
 ) -> AppResult<Response> {
     let token = bearer(&request).ok_or(AppError::Unauthorized)?;
-    let mut user = decode_user(&state, token)?;
-    let row: Option<(String, i64)> = sqlx::query_as("SELECT role,status FROM users WHERE id=?")
+    let (mut user,session_version) = decode_user(&state, token)?;
+    let row: Option<(String, i64,i64)> = sqlx::query_as("SELECT role,status,session_version FROM users WHERE id=?")
         .bind(user.uid)
         .fetch_optional(&state.pool)
         .await?;
-    let Some((role, status)) = row else {
+    let Some((role, status,current_version)) = row else {
         return Err(AppError::Unauthorized);
     };
+    if session_version != current_version { return Err(AppError::Unauthorized); }
     if status != 1 || !matches!(role.as_str(), "admin" | "user") {
         return Err(AppError::Unauthorized);
     }
@@ -95,16 +105,20 @@ pub async fn require_admin(
     next: Next,
 ) -> AppResult<Response> {
     let token = bearer(&request).ok_or(AppError::Unauthorized)?;
-    let mut user = decode_user(&state, token)?;
-    let row: Option<(String, i64)> = sqlx::query_as("SELECT role,status FROM users WHERE id=?")
+    let (mut user,session_version) = decode_user(&state, token)?;
+    let row: Option<(String, i64,i64)> = sqlx::query_as("SELECT role,status,session_version FROM users WHERE id=?")
         .bind(user.uid)
         .fetch_optional(&state.pool)
         .await?;
-    let Some((role, status)) = row else {
+    let Some((role, status,current_version)) = row else {
         return Err(AppError::Unauthorized);
     };
-    if role != "admin" || status != 1 {
+    if session_version != current_version { return Err(AppError::Unauthorized); }
+    if status != 1 {
         return Err(AppError::Unauthorized);
+    }
+    if role != "admin" {
+        return Err(AppError::Forbidden("此操作仅限管理员".into()));
     }
     user.role = role;
     request.extensions_mut().insert(user);
@@ -117,15 +131,15 @@ pub async fn require_user(
     next: Next,
 ) -> AppResult<Response> {
     let token = bearer(&request).ok_or(AppError::Unauthorized)?;
-    let mut user = decode_user(&state, token)?;
-    let row: Option<(String, i64)> = sqlx::query_as("SELECT role,status FROM users WHERE id=?")
+    let (mut user,session_version) = decode_user(&state, token)?;
+    let row: Option<(String, i64,i64)> = sqlx::query_as("SELECT role,status,session_version FROM users WHERE id=?")
         .bind(user.uid)
         .fetch_optional(&state.pool)
         .await?;
-    let Some((role, status)) = row else {
+    let Some((role, status,current_version)) = row else {
         return Err(AppError::Unauthorized);
     };
-    if !matches!(role.as_str(), "user" | "admin") || status != 1 {
+    if session_version != current_version || !matches!(role.as_str(), "user" | "admin") || status != 1 {
         return Err(AppError::Unauthorized);
     }
     user.role = role;
@@ -133,11 +147,15 @@ pub async fn require_user(
     Ok(next.run(request).await)
 }
 
-fn bearer(request: &Request) -> Option<&str> {
-    request
-        .headers()
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
+/// RFC 7235 规定认证方案名大小写不敏感，`bearer` / `BEARER` 都合法。
+pub(crate) fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| token.trim())
+        .filter(|token| !token.is_empty())
+}
+
+pub(crate) fn bearer(request: &Request) -> Option<&str> {
+    bearer_token(request.headers().get(header::AUTHORIZATION)?.to_str().ok()?)
 }
