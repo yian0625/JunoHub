@@ -36,7 +36,7 @@ JUNOHUB_EMAIL_DAILY_LIMIT=100
 
 ### 当前 Gmail 配置
 
-本地 `.env` 已配置 `smtp.gmail.com:465` 和 `tls`，发件账号为 `zhangjh060205@gmail.com`，应用专用密码已写入 `SMTP_PASSWORD`。本地后端已重新加载配置；2026-10-10 的真实 SMTP 测试通过 TLS 与身份认证，测试邮件已确认进入收件箱。凭证不记录在本文档中。
+本地 `.env` 已配置 `smtp.gmail.com:465` 和 `tls`，发件账号是一个 Gmail 账号（具体地址见本地 `.env` 的 `SMTP_USERNAME`），应用专用密码已写入 `SMTP_PASSWORD`。本地后端已重新加载配置；2026-10-10 的真实 SMTP 测试通过 TLS 与身份认证，测试邮件已确认进入收件箱。凭证不记录在本文档中。
 
 更换凭证时，由账号持有人在 [Google 应用专用密码](https://myaccount.google.com/apppasswords) 页面生成密码，并更新 `SMTP_PASSWORD`。如果 Google 将密码分组显示，填写时去掉分组空格。此密码不是网页登录密码，也不是邮箱收到的验证码。
 
