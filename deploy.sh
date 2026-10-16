@@ -8,11 +8,10 @@
 
 set -Eeuo pipefail
 
-ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 ENV_FILE="$ROOT_DIR/.env"
 ENV_TEMPLATE="$ROOT_DIR/.env.docker.example"
 COMPOSE_FILE="$ROOT_DIR/compose.yaml"
-MONITORING_FILE="$ROOT_DIR/compose.monitoring.yaml"
 BACKUP_DIR="${JUNOHUB_BACKUP_DIR:-$ROOT_DIR/backups}"
 BACKUP_KEEP="${JUNOHUB_BACKUP_KEEP:-7}"
 BACKUP_FORMAT=1
@@ -30,10 +29,10 @@ cd "$ROOT_DIR"
 # ---------------------------------------------------------------- 输出与工具
 
 if [[ -t 1 ]]; then
-  C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
   C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_BLUE=$'\033[34m'
 else
-  C_RESET=""; C_DIM=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+  C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
 fi
 
 log()  { printf '%s\n' "${C_BLUE}==>${C_RESET} $*"; }
@@ -345,9 +344,8 @@ create_backup() {
   log "启动服务以获取一致性快照（在线备份不会中断请求）"
   compose_up_wait >/dev/null
 
-  local server_container pg_container redis_container
+  local server_container redis_container
   server_container="$(compose ps -q junohub-server)"
-  pg_container="$(compose ps -q junohub-accounts-postgres)"
   redis_container="$(compose ps -q junohub-accounts-redis)"
   [[ -n "$server_container" ]] || die "找不到 junohub-server 容器"
 
@@ -563,7 +561,7 @@ cmd_restore() {
   [[ -n "$dir" ]] || die "用法：./deploy.sh restore <备份目录> [--yes]
 先用 ./deploy.sh status 查看可用备份，或 ./deploy.sh backup 创建一份。"
   check_docker; require_env
-  dir="$(CDPATH= cd -- "$dir" && pwd)"
+  dir="$(CDPATH='' cd -- "$dir" && pwd)"
   verify_backup_dir "$dir"
 
   step "即将恢复"
@@ -708,11 +706,15 @@ cmd_migrate() {
   cmd_status
 
   step "迁移完成"
-  local accounts_count
+  local accounts_count legacy_dir=""
   accounts_count="$(compose exec -T junohub-accounts-postgres sh -c \
     'psql -tA -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select count(*) from accounts"' 2>/dev/null | tr -d '[:space:]')"
   echo "  账户池账户数   ${accounts_count:-未知}"
-  if [[ "$accounts_count" == "0" && -d "$ROOT_DIR/data.migrated."* ]]; then
+  # 没有 nullglob，未命中时 glob 保持字面量，-d 会失败，legacy_dir 保持为空。
+  for candidate in "$ROOT_DIR"/data.migrated.*/; do
+    [[ -d "$candidate" ]] && { legacy_dir="$candidate"; break; }
+  done
+  if [[ "$accounts_count" == "0" && -n "$legacy_dir" ]]; then
     warn "新库账户数为 0，但旧目录仍存在 —— 迁移可能未生效，请不要删除 data.migrated.*，先排查。"
   fi
   echo "  现在数据都在命名卷里，项目目录不再包含数据库。"
