@@ -133,7 +133,7 @@ pub fn test_config(payload: &Value) -> AppResult<Option<crate::model_api::ApiCon
 }
 
 pub async fn probe_configured(state: &AppState, base: &str, key: &str, platform: &str, model: Option<&str>, config: Option<&crate::model_api::ApiConfig>) -> AppResult<Probe> {
-    if tokenhub_image_model(base, model) { return probe(state, base, key, platform, model).await; }
+    if tokenhub_image_model(&state.config.tokenhub_image_hosts, &state.config.tokenhub_image_models, base, model) { return probe(state, base, key, platform, model).await; }
     if let (Some(model), Some(config)) = (model.map(str::trim).filter(|model| !model.is_empty()), config) {
         if model.len() > 200 { return Err(AppError::BadRequest("模型名称不能超过 200 字符".into())); }
         let url = config.upstream_target(base, config.api_type.endpoint().unwrap(), "")?;
@@ -195,9 +195,21 @@ pub async fn models(state: &AppState, provider: &ProviderSecret) -> AppResult<Ve
         Err(AppError::BadRequest(report.message))
     }
 }
-pub fn tokenhub_image_model(base: &str, model: Option<&str>) -> bool {
-    reqwest::Url::parse(base).ok().and_then(|u| u.host_str().map(str::to_owned)).as_deref() == Some("tokenhub.piegateway.me")
-        && model.is_some_and(|m| matches!(m.trim(), "gpt-image-2" | "gpt-image-2.5-sunburst" | "gpt-image-2.5-flare"))
+/// 该 base_url 与上游模型是否应当走 TokenHub 图片适配。
+/// 主机名与模型列表都由配置提供，代码里不再内置第三方供应商地址或模型名。
+pub fn tokenhub_image_model(
+    hosts: &[String],
+    models: &[String],
+    base: &str,
+    model: Option<&str>,
+) -> bool {
+    if !crate::config::host_is_listed(hosts, base) {
+        return false;
+    }
+    model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .is_some_and(|model| models.iter().any(|configured| configured == model))
 }
 
 async fn tokenhub_image_probe(client: &reqwest::Client, base: &str, key: &str, model: &str) -> AppResult<Probe> {
@@ -252,7 +264,7 @@ pub async fn probe(
     platform: &str,
     model: Option<&str>,
 ) -> AppResult<Probe> {
-    if tokenhub_image_model(base, model) {
+    if tokenhub_image_model(&state.config.tokenhub_image_hosts, &state.config.tokenhub_image_models, base, model) {
         return tokenhub_image_probe(&state.client,base,key,model.unwrap().trim()).await;
     }
     let started = Instant::now();
@@ -631,11 +643,33 @@ mod tests {
         assert!(report.ok,"{}",report.message);
     }
     #[test]
-    fn image_adapter_is_scoped_to_documented_tokenhub_models() {
-        assert!(tokenhub_image_model("https://tokenhub.piegateway.me/v1",Some("gpt-image-2")));
-        assert!(!tokenhub_image_model("https://example.com/v1",Some("gpt-image-2")));
-        assert!(!tokenhub_image_model("https://tokenhub.piegateway.me/v1",Some("gpt-5.6-sol")));
-        assert!(!tokenhub_image_model("https://tokenhub.piegateway.me/v1",None));
+    fn image_adapter_is_scoped_to_the_configured_hosts_and_models() {
+        let hosts = vec!["images.example.test".to_string()];
+        let models = vec!["gpt-image-2".to_string(), "gpt-image-2.5-sunburst".to_string()];
+        let base = "https://images.example.test/v1";
+        assert!(tokenhub_image_model(&hosts, &models, base, Some("gpt-image-2")));
+        // 主机名大小写不敏感。
+        assert!(tokenhub_image_model(&hosts, &models, "https://IMAGES.Example.Test/v1", Some("gpt-image-2.5-sunburst")));
+        // 主机不在配置内、模型不在配置内、模型缺失，都不启用适配。
+        assert!(!tokenhub_image_model(&hosts, &models, "https://other.example.test/v1", Some("gpt-image-2")));
+        assert!(!tokenhub_image_model(&hosts, &models, base, Some("gpt-5.6-sol")));
+        assert!(!tokenhub_image_model(&hosts, &models, base, None));
+        assert!(!tokenhub_image_model(&hosts, &models, base, Some("   ")));
+        // 未配置任何主机时适配整体不生效 —— 代码里没有内置的供应商地址。
+        assert!(!tokenhub_image_model(&[], &models, base, Some("gpt-image-2")));
+        assert!(!tokenhub_image_model(&hosts, &[], base, Some("gpt-image-2")));
+        // base_url 不是合法 URL 时不能 panic，只是不匹配。
+        assert!(!tokenhub_image_model(&hosts, &models, "not a url", Some("gpt-image-2")));
+    }
+
+    #[test]
+    fn image_endpoint_adapter_requires_a_configured_host_and_the_image_path() {
+        let hosts = vec!["images.example.test".to_string()];
+        assert!(crate::tokenhub_images::is_endpoint(&hosts, "https://images.example.test/v1", "/v1/images/generations"));
+        assert!(crate::tokenhub_images::is_endpoint(&hosts, "https://images.example.test/v1", "/v1/images/generations?x=1"));
+        assert!(!crate::tokenhub_images::is_endpoint(&hosts, "https://other.example.test/v1", "/v1/images/generations"));
+        assert!(!crate::tokenhub_images::is_endpoint(&hosts, "https://images.example.test/v1", "/v1/chat/completions"));
+        assert!(!crate::tokenhub_images::is_endpoint(&[], "https://images.example.test/v1", "/v1/images/generations"));
     }
     #[test]
     fn endpoint_preserves_prefix_and_query_without_duplicate_routes() {

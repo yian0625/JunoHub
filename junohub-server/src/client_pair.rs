@@ -988,6 +988,8 @@ mod tests {
                 scheduler_worker_enabled: false,
                 account_engine_gateway_enabled: false,
                 allowed_origins: Vec::new(),
+                tokenhub_image_hosts: Vec::new(),
+                tokenhub_image_models: Vec::new(),
                 log_retention_days: 0,
             }),
             client: Client::builder()

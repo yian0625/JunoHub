@@ -274,12 +274,17 @@ async fn main() -> Result<()> {
 }
 
 async fn migrate_sub2api_provider_base_urls(state: &AppState) {
-    // 一次性迁移：把指向已删除 Go 网关的存量 base_url 改写为 Rust 引擎自身地址。
-    // 旧地址用 SQL 拼接表达，避免在代码中出现活的 Go 网关引用。
+    // 一次性迁移：把存量托管供应商的 base_url 统一收敛为与部署无关的标记值。
+    //
+    // 历史上有两种值需要清理：指向已删除 Go 网关的地址，以及指向本服务容器名
+    // 的地址。两者都是把部署拓扑写进了业务数据，换部署就失效。托管供应商的
+    // 请求本来就由账户引擎进程内转发，这个字段不参与路由。
     let updated = sqlx::query(
-        "UPDATE user_providers SET base_url='http://junohub-server:9003/v1',updated_at=? WHERE provider_type='sub2api' AND base_url LIKE 'http://'||'sub2api'||':8080%'",
+        "UPDATE user_providers SET base_url=?,updated_at=? WHERE provider_type='sub2api' AND base_url<>?",
     )
+    .bind(crate::store::MANAGED_PROVIDER_BASE_URL)
     .bind(crate::store::now())
+    .bind(crate::store::MANAGED_PROVIDER_BASE_URL)
     .execute(&state.pool)
     .await;
     match updated {

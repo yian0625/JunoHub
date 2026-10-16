@@ -398,12 +398,13 @@ async fn forward_inner(
         if upload.is_none()
             && !route.config.is_task()
             && request_path.is_empty()
-            && crate::tokenhub_images::is_endpoint(&key.base_url, path)
+            && crate::tokenhub_images::is_endpoint(&state.config.tokenhub_image_hosts, &key.base_url, path)
         {
             if method != Method::POST {
                 return Err(AppError::BadRequest("图片生成接口需要 POST".into()));
             }
             let response = crate::tokenhub_images::forward(
+                &state.config.tokenhub_image_models,
                 &state.client,
                 &key.base_url,
                 &raw,
