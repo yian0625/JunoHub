@@ -32,9 +32,9 @@ import { EmptyGrid, ErrorState, Field, FormDialog, FormError, LoadingState, Page
 import { useConsoleGuard } from "../_components/use-console-guard"
 
 const providerTemplates = [
-  { id: "sub2api", label: "Sub2API", description: "账户池、调度与故障切换", baseUrl: "http://junohub-server:9003/v1", icon: Sparkles },
-  { id: "openai", label: "OpenAI", description: "OpenAI 官方接口", baseUrl: "https://api.openai.com/v1", icon: OpenAIIcon },
-  { id: "openai-compatible", label: "兼容服务", description: "其他 OpenAI 兼容端点", baseUrl: "", icon: Server },
+  { id: "sub2api", label: "Sub2API", description: "账户池、调度与故障切换", icon: Sparkles },
+  { id: "openai", label: "OpenAI", description: "OpenAI 官方接口", icon: OpenAIIcon },
+  { id: "openai-compatible", label: "兼容服务", description: "其他 OpenAI 兼容端点", icon: Server },
 ] as const
 
 const accountPlatforms = [
@@ -49,6 +49,9 @@ const accountPlatforms = [
   { id: "custom", label: "自定义", description: "OpenAI 兼容接口", baseUrl: "", icon: CustomIcon },
 ] as const
 
+// 托管供应商的地址不参与路由，后端只存一个与部署无关的标记值；
+// 界面统一显示成人话，不把标记值暴露给用户。
+const MANAGED_POOL_LABEL = "由内置账户池管理"
 const emptyForm = { name: "", provider_type: "openai-compatible", base_url: "", api_key: "", avatar_url: "" }
 const oauthCallbackMessage = "junohub:oauth-callback"
 const oauthPlatforms = new Set(["openai", "anthropic", "gemini", "grok", "antigravity"])
@@ -613,7 +616,7 @@ export default function ProvidersPage() {
           </AppForm>
         </div>
         <div hidden={managedTab !== "accounts"}>
-          {<div className="mb-5 flex flex-wrap items-center justify-between gap-3 border-b border-border-default pb-4"><div className="min-w-0"><p className="text-sm font-semibold">供应商资料</p><p className="mt-1 break-words text-sm">{managedTarget.name}</p><p className="mt-1 break-all text-xs text-muted-foreground">{managedTarget.base_url}</p></div><Button type="button" variant="outline" size="sm" disabled={managedSaving || capacityBusy} onClick={() => editProviderConnection(managedTarget)}>编辑供应商</Button></div>}
+          {<div className="mb-5 flex flex-wrap items-center justify-between gap-3 border-b border-border-default pb-4"><div className="min-w-0"><p className="text-sm font-semibold">供应商资料</p><p className="mt-1 break-words text-sm">{managedTarget.name}</p><p className="mt-1 break-all text-xs text-muted-foreground">{managedTarget.managed ? MANAGED_POOL_LABEL : managedTarget.base_url}</p></div><Button type="button" variant="outline" size="sm" disabled={managedSaving || capacityBusy} onClick={() => editProviderConnection(managedTarget)}>编辑供应商</Button></div>}
           <div className="space-y-5" aria-busy={managedLoading || managedSaving}>
             <div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="text-base font-semibold">{managedTarget.managed ? "已连接的账户" : "已配置的 Key"}</h2><p className="mt-1.5 text-sm text-muted-foreground">每份凭证独立保存，可单独更新或移除。</p></div></div>
             {managedLoading ? (
@@ -755,7 +758,7 @@ function providerPresentation(item: ConsoleProvider) {
           ? Sparkles
           : Server,
     title: item.name,
-    meta: `${providerLabel(item.provider_type)} · ${item.base_url}`,
+    meta: `${providerLabel(item.provider_type)} · ${item.managed ? MANAGED_POOL_LABEL : item.base_url}`,
   }
 }
 

@@ -152,6 +152,11 @@ fn validate_delivery_config(config: &EmailConfig) -> AppResult<()> {
     match config.provider {
         EmailProvider::Smtp => crate::smtp_email::validate(&config.smtp),
         EmailProvider::Resend if config.api_key.is_empty() => Err(AppError::ServiceUnavailable("验证码邮件服务尚未配置，请联系管理员。".into())),
+        // 发件地址必须由 RESEND_FROM 显式提供：这里曾经回退到一个写死的域名，
+        // 结果是没有配置的部署会拿别人的域名发信，而且失败得很难懂。
+        EmailProvider::Resend if config.from.trim().is_empty() => Err(AppError::ServiceUnavailable(
+            "验证码邮件服务缺少 RESEND_FROM，请联系管理员配置发件地址。".into(),
+        )),
         EmailProvider::Resend => Ok(()),
     }
 }
@@ -260,7 +265,7 @@ mod tests {
         let app = Router::new().route("/emails", post(|headers: HeaderMap, Json(body): Json<Value>| async move {
             assert_eq!(headers["authorization"], "Bearer fixture-key");
             assert_eq!(headers["idempotency-key"], "registration/fixture-generation");
-            assert_eq!(body["from"], "JunoHub <noreply@zhangjh0508.dpdns.org>");
+            assert_eq!(body["from"], "JunoHub <fixture@example.test>");
             assert_eq!(body["to"], json!(["member@example.test"]));
             assert!(body["text"].as_str().unwrap().contains("123456"));
             assert!(body["html"].as_str().unwrap().contains("123456"));
@@ -269,9 +274,23 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let config = EmailConfig { api_key: "fixture-key".into(), ..Default::default() };
+        let config = EmailConfig { api_key: "fixture-key".into(), from: "JunoHub <fixture@example.test>".into(), ..Default::default() };
         let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).redirect(reqwest::redirect::Policy::none()).build().unwrap();
         transmit(&client, &format!("http://{address}/emails"), &config, "member@example.test", "123456", "fixture-generation").await.unwrap();
         server.abort();
+    }
+
+    #[test]
+    fn resend_without_a_sender_address_is_reported_not_silently_defaulted() {
+        let config = EmailConfig { api_key: "fixture-key".into(), ..Default::default() };
+        assert!(config.from.trim().is_empty());
+        let error = validate_delivery_config(&config).unwrap_err();
+        assert!(error.to_string().contains("RESEND_FROM"), "{error}");
+        // 空白字符串同样算未配置，不能被当成有效发件地址。
+        let blank = EmailConfig { api_key: "fixture-key".into(), from: "   ".into(), ..Default::default() };
+        assert!(validate_delivery_config(&blank).is_err());
+        // 配好之后必须放行。
+        let configured = EmailConfig { api_key: "fixture-key".into(), from: "JunoHub <noreply@example.test>".into(), ..Default::default() };
+        assert!(validate_delivery_config(&configured).is_ok());
     }
 }

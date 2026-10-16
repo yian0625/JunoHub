@@ -5,9 +5,10 @@ use axum::{body::Body, http::{HeaderMap, StatusCode}, response::Response};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-pub fn is_endpoint(base: &str, path: &str) -> bool {
-    reqwest::Url::parse(base).ok().and_then(|u| u.host_str().map(str::to_owned)).as_deref() == Some("tokenhub.piegateway.me")
-        && path.split('?').next() == Some("/v1/images/generations")
+/// base_url 的主机是否落在已配置的 TokenHub 图片主机内。
+/// 主机与模型都由配置提供，代码里不再内置任何第三方供应商地址。
+pub fn is_endpoint(hosts: &[String], base: &str, path: &str) -> bool {
+    crate::config::host_is_listed(hosts, base) && path.split('?').next() == Some("/v1/images/generations")
 }
 fn output(status: StatusCode, body: Value) -> Response {
     Response::builder().status(status).header("content-type","application/json")
@@ -16,10 +17,12 @@ fn output(status: StatusCode, body: Value) -> Response {
 fn error(status: StatusCode, message: &str, task: Option<&str>) -> Response {
     output(status,json!({"error":{"message":message,"type":"image_generation_error","task_id":task}}))
 }
-fn body(payload: &Value) -> AppResult<Value> {
+fn body(models: &[String], payload: &Value) -> AppResult<Value> {
     let model = payload["model"].as_str().unwrap_or("");
-    if !matches!(model,"gpt-image-2"|"gpt-image-2.5-sunburst"|"gpt-image-2.5-flare") {
-        return Err(AppError::BadRequest("此图片接口目前支持 TokenHub GPT Image 2 / 2.5，请配置对应的上游模型。".into()));
+    if !models.iter().any(|configured| configured == model) {
+        return Err(AppError::BadRequest(
+            "该模型不在 TokenHub 图片适配的模型列表内，请检查上游模型配置。".into(),
+        ));
     }
     if payload["prompt"].as_str().is_none_or(|s| s.trim().is_empty()) {
         return Err(AppError::BadRequest("图片生成需要非空 prompt".into()));
@@ -36,8 +39,8 @@ fn body(payload: &Value) -> AppResult<Value> {
     Ok(body)
 }
 
-pub async fn forward(client: &reqwest::Client, base: &str, key: &str, headers: &HeaderMap, payload: &Value) -> AppResult<Response> {
-    let payload = body(payload)?;
+pub async fn forward(models: &[String], client: &reqwest::Client, base: &str, key: &str, headers: &HeaderMap, payload: &Value) -> AppResult<Response> {
+    let payload = body(models, payload)?;
     let mut url = reqwest::Url::parse(base).map_err(|_|AppError::BadRequest("图片服务地址无效".into()))?;
     url.set_path("/v2/extend/image/async/gpt_image/generations");url.set_query(None);url.set_fragment(None);
     let mut request = client.post(url.clone()).header("X-API-Key",key).timeout(Duration::from_secs(20)).json(&payload);

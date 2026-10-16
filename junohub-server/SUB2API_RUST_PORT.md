@@ -183,7 +183,7 @@ Historical checked milestones below are not a full compatibility certification. 
   - [x] Grok CLI gateway identity headers and Responses/Chat Completions forwarding
   - [x] Engine builds its own upstream headers (no client header leakage)
   - [x] sub2api providers never fall back to the removed Go base URL
-  - [x] Existing provider rows migrated to `http://junohub-server:9003/v1` at startup
+  - [x] Existing provider rows migrated to the deployment-independent `managed:account-engine` marker at startup
 - [x] Usage accounting
   - [x] JSON and SSE usage extraction with tokenizer fallback when upstream omits input usage
   - [x] Per-request and per-Key token totals in the JunoHub console

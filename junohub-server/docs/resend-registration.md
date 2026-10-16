@@ -30,7 +30,7 @@ API Key 仅保存在后端环境中，不提交 Git，不添加 `NEXT_PUBLIC_` �
 
 ## 验证状态
 
-2026-10-10，在 Resend 控制台提交 `zhangjh0508.dpdns.org` 后，域名输入框提示：`We don't allow free public domains. Please use a domain you own instead.` 域名未创建，尚未生成验证记录；未修改 Cloudflare DNS。需要更换 Resend 接受的域名，再更新 `RESEND_FROM`。项目当前默认发件域名仍为原请求的域名，`RESEND_API_KEY` 未配置，真实发信尚未启用。
+2026-10-10，在 Resend 控制台提交一个免费公共域名被拒绝，提示：`We don't allow free public domains. Please use a domain you own instead.` 域名未创建，尚未生成验证记录；未修改 Cloudflare DNS。Resend 需要自有域名，配置后把发件地址写入 `RESEND_FROM`。代码不再内置任何默认发件域名：未配置 `RESEND_FROM` 时发送会被明确拒绝并提示缺少该变量，`RESEND_API_KEY` 未配置时同样拒绝，真实发信尚未启用。
 
 本地测试使用内存数据库和本机模拟 Resend 服务，不向真实邮箱发信。实际收信仍需完成 API Key 和 DNS 配置后验证。
 
