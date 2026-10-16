@@ -132,7 +132,7 @@ pub struct EmailConfig {
 
 impl Default for EmailConfig {
     fn default() -> Self {
-        Self { provider: EmailProvider::Resend, smtp: SmtpConfig::default(), api_key: String::new(), from: "JunoHub <noreply@zhangjh0508.dpdns.org>".into(), daily_limit: 100 }
+        Self { provider: EmailProvider::Resend, smtp: SmtpConfig::default(), api_key: String::new(), from: String::new(), daily_limit: 100 }
     }
 }
 
@@ -192,7 +192,7 @@ impl EmailConfig {
         let mut config = Self {
             provider,
             api_key: get("RESEND_API_KEY").unwrap_or_default().trim().to_owned(),
-            from: get("RESEND_FROM").unwrap_or_else(|| Self::default().from),
+            from: get("RESEND_FROM").unwrap_or_default().trim().to_owned(),
             daily_limit,
             ..Default::default()
         };
